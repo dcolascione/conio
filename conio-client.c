@@ -266,6 +266,11 @@ Environment:
 
     if (Index < ConpHandleTableSize) {
         Slave = ConpHandleTable[Index];
+        if (Slave->HandleFlags & HANDLE_FLAG_PROTECT_FROM_CLOSE) {
+            ReleaseSRWLockExclusive (&ConpHandleTableLock);
+            return TRUE;
+        }
+
         ConpHandleTable[Index] = NULL;
     }
 
@@ -390,22 +395,31 @@ Environment:
 {
     PCON_SLAVE ExistingSlave;
     HANDLE NewSlaveHandle;
+    BOOL Result = FALSE;
 
     ExistingSlave = ConpReferenceSlaveHandle (Source);
     if (ExistingSlave == NULL) {
-        return FALSE;
+        goto Out;
     }
 
-    // XXX: create separate connection to server instead of
-    // referencing other handle again
-
-    NewSlaveHandle = ConpInsertHandle (ExistingSlave);
-    if (NewSlaveHandle == NULL) {
-        return FALSE;
+    if (!ConpConnectSlaveHandle (ExistingSlave->ServerPid,
+                                 ExistingSlave->Cookie,
+                                 Inherit ? HANDLE_FLAG_INHERIT : 0,
+                                 &NewSlaveHandle))
+    {
+        goto Out;
     }
 
     *Destination = NewSlaveHandle;
-    return TRUE;
+    Result = TRUE;
+
+  Out:
+
+    if (ExistingSlave) {
+        ConpDereferenceSlave (ExistingSlave);
+    }
+
+    return Result;
 }
 
 static
@@ -752,7 +766,7 @@ ConpSlaveReadFile (
     LocalBytesRead = Message.Size - CON_MESSAGE_SIZE (ReadFileReply);
     if (NumberOfBytesRead) {
         *NumberOfBytesRead = LocalBytesRead;
-            
+
     }
 
     if (Overlapped) {
@@ -835,9 +849,10 @@ ConpWaitForObjects (
 
 BOOL
 ConpConnectSlaveHandle (
-    ULONG ServerPid,
-    ULONG Cookie,
-    HANDLE* NewHandle
+    /* In */  ULONG ServerPid,
+    /* In */  ULONG Cookie,
+    /* In */  ULONG HandleFlags,
+    /* Out */ HANDLE* NewHandle
     )
 {
     WCHAR PipeName[ARRAYSIZE (CON_PIPE_FORMAT)];
@@ -870,6 +885,7 @@ ConpConnectSlaveHandle (
 
     Slave->Cookie = Cookie;
     Slave->ServerPid = ServerPid;
+    Slave->HandleFlags = HandleFlags;
 
     LocalNewHandle = ConpInsertHandle (Slave);
     if (LocalNewHandle == NULL) {
@@ -915,6 +931,10 @@ ConpInheritConsoleInformation (
                                StartupInfoSectionName);
 
     if (Section == NULL) {
+        if (GetLastError () == ERROR_FILE_NOT_FOUND) {
+            Result = TRUE;
+        }
+
         goto Out;
     }
 
@@ -934,7 +954,7 @@ ConpInheritConsoleInformation (
         goto Out;
     }
 
-    
+
 
   Out:
 

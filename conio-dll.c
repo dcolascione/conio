@@ -4,6 +4,8 @@
 #include "coniop.h"
 #include "hook.h"
 
+BOOL ConpInheritConsoleInformation (VOID);
+
 BOOL WINAPI
 DllMain (HINSTANCE Inst,
          DWORD Reason,
@@ -17,12 +19,9 @@ DllMain (HINSTANCE Inst,
 
             if (!HkHookProcessCreation (
                     "conio-32.dll",
-                    "conio-64.dll"))
-            {
-                return FALSE;
-            }
-
-            if (!ConpHookApis ())
+                    "conio-64.dll")
+                || !ConpHookApis ()
+                || !ConpInheritConsoleInformation ())
             {
                 return FALSE;
             }

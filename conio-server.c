@@ -1347,6 +1347,7 @@ ConMakeSlaveHandle (
     (VOID) ConpConnectSlaveHandle (
         GetCurrentProcessId (),
         ActiveOutput->Cookie,
+        0 /*HandleFlags */,
         &SlaveHandle);
 
     ConpDereferenceOutput (ActiveOutput);

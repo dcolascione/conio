@@ -18,7 +18,6 @@
 
 typedef struct _CON_STARTUP_HANDLE {
     ULONG InheritedHandle;
-    ULONG PipeHandle;
     ULONG ServerPid;
     ULONG Cookie;
     ULONG HandleFlags;
@@ -74,9 +73,10 @@ typedef struct _CON_MESSAGE {
 
 BOOL
 ConpConnectSlaveHandle (
-    /* _In_ */ ULONG ServerPid,
-    /* _In_ */ ULONG Cookie,
-    /* _Out_ */ HANDLE* NewHandle
+    /* In */ ULONG ServerPid,
+    /* In */ ULONG Cookie,
+    /* In */ ULONG HandleFlags,
+    /* Out */ HANDLE* NewHandle
     );
 
 VOID ConpTrace (PCWSTR Format, ...);
