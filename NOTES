@@ -1,0 +1,9 @@
+Windows console attach has bizarre side effects:
+
+- If STARTF_USESTDHANDLES is specified, console leaves the standard handles alone
+
+- Otherwise, it resets the standard handles to the console every time you attach!
+
+- However, even in the STARTF_USESTDHANDLES case, if one of the
+  standard handles is NULL, we actually set that standard handle
+  anyway

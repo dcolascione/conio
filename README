@@ -1,0 +1,145 @@
+-*- mode: text; fill-column: 72; -*-
+
+This library provides a hook-based pseudoconsole layer for Windows.
+Analogously to Unix ptys, this library splits the Windows console
+concept into "master" and "slave" sides.  Programs connect to slave
+pseudoconsoles just as they would real console handles; operations on
+these pseudoconsole slave handles are redirected to the pseudoconsole
+master process, where the library delivers them to the master through a
+set of callbacks.  The library implements mechanism, not policy, and
+leaves the actual presentation of the console to the program hosting the
+master side of the pseudoconsole.
+
+Conio's implementation of console handles is hook-based: console handles
+are not "real" handles, but are instead pseudo-handles maintained
+entirely in userspace.  The library hooks various system APIs to
+maintain the illusion that these handles are real system handles, and it
+hooks CreateProcess in order to propagate the code maintaining this
+illusion to child processes. No separate server, daemon, or system
+configuration is needed.
+
+COMPATIBILITY
+-------------
+
+The implementation has essentially the same properties that the built-in
+Windows console subsystem had prior to Windows 8, where consoles became
+real kernel objects.  Nearly any program that works correctly under
+Windows 7 will work currently with conio pseudoconsoles.  Some things
+that work with neither conio nor Windows 7 consoles are
+
+    - cross-process DuplicateHandle,
+    - thread pool APIs,
+    - asynchronous (i.e., OVERLAPPED) IO, and
+    - the NT native API.
+
+There is just one feature that Windows 7 consoles support that conio
+does not.  Consider the following process tree:
+
+    A        E
+   / \       |
+  B   C      F
+       \
+        D
+
+Process A links against the conio DLL, and by hooking CreateProcess,
+conio ensures that all of A's children also use conio.  All processes in
+the left process tree can call AttachConsole on each other, and
+regardless of whether the current console of the process to be attached
+happens to be a conio pseudoconsole, everything will work fine.  What
+does not work is a process in the right, unrelated tree --- E or F ---
+calling AttachConsole on a process in the left tree.  From the point of
+Windows itself, the processes in the left tree are not attached to any
+console, so a call to AttachConsole directed at any of them will fail
+with ERROR_INVALID_HANDLE.
+
+In practice, this limitation doesn't matter because nobody actually
+calls AttachConsole on unrelated processes.
+
+USAGE
+-----
+
+A pseudoconsole (just a "console" hereafter) logically consists of a
+queue of input events, one or more output buffers, and an event that's
+signaled when the input queue is non-empty.  A console has zero or one
+"active" output buffers.  A slave handle refers to either the input
+queue or one of the output screen buffers.  To create a console, the
+process hosting the master side of the console calls
+ConCreatePseudoConsole, providing a set of callbacks that implement the
+console APIs called by slaves.  ConCreatePseudoConsole yields a HANDLE
+to the console's input queue.  A caller then calls
+ConCreateConsoleScreenBuffer to create the console's first output
+buffer, providing to ConCreateConsoleScreenBuffer a
+PCONSOLE_SCREEN_BUFFER_INFOEX that describes the characteristics of this
+buffer.  A call to ConAttachToSlave works like AttachConsole and makes
+the given console the current console for the process.
+
+At this point, the process hosting the pseudoconsole master can work
+with the console in exactly the same way it works with normal consoles.
+Propagation of the console handles to child processes works just as it
+does with native console handles.
+
+A given process can have multiple master and slave handles open, and a
+single process can contain multiple master objects and multiple slave
+handles.  In the above diagram, it's conceivable that A, B, C, and D all
+have a master pseudoconsole used by each of the other processes in this
+group and itself.
+
+IMPLEMENTATION
+--------------
+
+Masters and slaves communicate over named pipes.  Each slave handle is
+identified by the tuple (SERVER, COOKIE), with the name of the named
+pipe corresponding to this handle being
+sprintf("Global\conio-slave-%08x-08x", SERVER, COOKIE).  SERVER is the
+process ID of the process hosting the pseudoconsole master.  COOKIE is
+an opaque server-allocated 32-bit integer that identifies the handle.
+
+While a process's current console is a conio pseudoconsole slave, a
+shared section called "Global\conio-coninfo-<pid>" exists that describes
+this pseudoconsole.  We need this section so that AttachConsole, which
+knows nothing other than the identity of the process to which the caller
+wants to attach, can find the process hosting the master side of the
+pseudoconsole and send it an attachment request.
+
+Similarly, conio uses named sections to tell child processes about the
+console handles they inherit.  When conio's DLL loads (which, in a child
+of a conio process, will happen very early in process startup), the DLL
+looks for a section named "Global\conio-startinfo-<pid>".  If this
+section is present, conio pre-populates its internal handle table using
+information contained in the section.
+
+So, to create a child process, a conio-using process does the following:
+
+  1. The process calls CreateProcess as normal, which causes conio's
+     hook to gain control.
+
+  2. Conio's hook creates the child process suspended.  The child's pid
+     is CHILD.
+
+  3. For each inheritable pseudoconsole slave handle in the current
+     process (perhaps filtered by PROC_THREAD_ATTRIBUTE_HANDLE_LIST),
+     send a message to that handle's master process asking the master to
+     create a handle for the child process.
+
+  4. Create a named shared section describing the handles so created;
+     this section also tells the child what its current console, if any,
+     should be, naming the section ("Global\conio-startinfo-%08x", PID).
+
+  5. Duplicate a handle to this named section into the child, updating
+     the section to include the value of the duplicated handle so that
+     the child will be able to close it.
+
+  6. Resume the child process if the caller didn't specify
+     CREATE_SUSPENDED.
+
+When the child starts, it looks for a section with the appropriate name,
+and having found it, loads handle information from it, releasing both
+the handle it used to open the section and the handle that was duped
+into it.
+
+BUGS
+----
+
+This implementation tries to be bug-for-bug compatible with the legacy
+Windows console layer, but there are bound to be corner cases where
+behavior differs.  Please report any problems encountered.
