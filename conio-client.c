@@ -1,8 +1,10 @@
 #include <windows.h>
+#include <winternl.h>
 #include <stdio.h>
 #include "conio.h"
 #include "coniop.h"
 #include "hook.h"
+#include "xdefs.h"
 
 //
 // This file hooks many Win32 functions in order to create the
@@ -218,10 +220,10 @@ Environment:
 
     if (NewReferenceCount == 0) {
         if (Slave->Pipe) {
-            CloseHandle (Slave->Pipe);
+            CONP_VERIFY (CloseHandle (Slave->Pipe));
         }
 
-        LocalFree (Slave);
+        CONP_VERIFY (LocalFree (Slave));
     }
 }
 
@@ -402,6 +404,8 @@ Environment:
         goto Out;
     }
 
+    ConpTrace (L"DUP: Existing handle %p", Source);
+
     if (!ConpConnectSlaveHandle (ExistingSlave->ServerPid,
                                  ExistingSlave->Cookie,
                                  Inherit ? HANDLE_FLAG_INHERIT : 0,
@@ -411,6 +415,7 @@ Environment:
     }
 
     *Destination = NewSlaveHandle;
+    ConpTrace (L"DUP: New handle %p", *Destination);
     Result = TRUE;
 
   Out:
@@ -686,7 +691,7 @@ Environment:
     // operations on this handle.
     //
 
-    CloseHandle (Slave->Pipe);
+    CONP_VERIFY (CloseHandle (Slave->Pipe));
     Slave->Pipe = NULL;
     ReleaseSRWLockExclusive (&Slave->PipeLock);
     return FALSE;
@@ -694,7 +699,7 @@ Environment:
 
 static
 HANDLE
-ConpHandleClearLowBit (
+ConpClearLowHandleBit (
     HANDLE Handle
     )
 /*++
@@ -771,8 +776,8 @@ ConpSlaveReadFile (
 
     if (Overlapped) {
         Overlapped->InternalHigh = LocalBytesRead;
-        if (ConpHandleClearLowBit (Overlapped->hEvent)) {
-            (VOID) SetEvent (ConpHandleClearLowBit (Overlapped->hEvent));
+        if (ConpClearLowHandleBit (Overlapped->hEvent)) {
+            (VOID) SetEvent (ConpClearLowHandleBit (Overlapped->hEvent));
         }
     }
 
@@ -824,8 +829,8 @@ ConpSlaveWriteFile (
 
     if (Overlapped) {
         Overlapped->InternalHigh = Message.WriteFileReply.NumberBytesWritten;
-        if (ConpHandleClearLowBit (Overlapped->hEvent)) {
-            (VOID) SetEvent (ConpHandleClearLowBit (Overlapped->hEvent));
+        if (ConpClearLowHandleBit (Overlapped->hEvent)) {
+            (VOID) SetEvent (ConpClearLowHandleBit (Overlapped->hEvent));
         }
     }
 
@@ -847,13 +852,42 @@ ConpWaitForObjects (
     return 0;
 }
 
+static
 BOOL
-ConpConnectSlaveHandle (
+ConpConnectSlave (
     /* In */  ULONG ServerPid,
     /* In */  ULONG Cookie,
     /* In */  ULONG HandleFlags,
-    /* Out */ HANDLE* NewHandle
+    /* Out */ PCON_SLAVE* NewSlave
     )
+/*++
+
+Routine Description:
+
+    Connect to a master object identified by ServerPid and Cookie and
+    return a new slave pointer.  The slave isn't yet inserted in the
+    handle table.
+
+Arguments:
+
+    ServerPid - Supplies the PID of the server for the handle.
+
+    Cookie - Supplies a server-allocated opaque ID for the handle.
+
+    HandleFlags - Supplies handle flags; see GetHandleInformation.
+
+    NewSlave - Receives a new slave on success.  The new slave has a
+               reference count of one.
+
+Return Value:
+
+    TRUE on success; FALSE on failure with thread-error set.
+
+Environment:
+
+    Arbitrary.
+
+--*/
 {
     WCHAR PipeName[ARRAYSIZE (CON_PIPE_FORMAT)];
     PCON_SLAVE Slave = NULL;
@@ -867,7 +901,8 @@ ConpConnectSlaveHandle (
 
     Slave->ReferenceCount = 1;
 
-    swprintf (PipeName, CON_PIPE_FORMAT, ServerPid, Cookie);
+    CONP_VERIFY (swprintf (PipeName, CON_PIPE_FORMAT, ServerPid, Cookie)
+                 == ARRAYSIZE (CON_PIPE_FORMAT) - 1);
 
     Slave->Pipe = CreateFile (
         PipeName,
@@ -880,19 +915,18 @@ ConpConnectSlaveHandle (
 
     if (Slave->Pipe == INVALID_HANDLE_VALUE) {
         Slave->Pipe = NULL;
-        goto Out;
+
+        //
+        // Don't fail here: duplicating a disconnected handle is a
+        // reasonable thing to do.
+        //
     }
 
     Slave->Cookie = Cookie;
     Slave->ServerPid = ServerPid;
     Slave->HandleFlags = HandleFlags;
-
-    LocalNewHandle = ConpInsertHandle (Slave);
-    if (LocalNewHandle == NULL) {
-        goto Out;
-    }
-
-    *NewHandle = LocalNewHandle;
+    *NewSlave = Slave;
+    Slave = NULL;
     Result = TRUE;
 
   Out:
@@ -905,16 +939,90 @@ ConpConnectSlaveHandle (
 }
 
 BOOL
+ConpConnectSlaveHandle (
+    /* In */  ULONG ServerPid,
+    /* In */  ULONG Cookie,
+    /* In */  ULONG HandleFlags,
+    /* Out */ HANDLE* NewHandle
+    )
+/*++
+
+Routine Description:
+
+    Connect to a master object identified by ServerPid and Cookie and
+    return a new slave handle.
+
+Arguments:
+
+    ServerPid - Supplies the PID of the server for the handle.
+
+    Cookie - Supplies a server-allocated opaque ID for the handle.
+
+    HandleFlags - Supplies handle flags; see GetHandleInformation.
+
+    NewHandle - Receives a new slave handle on success.
+
+Return Value:
+
+    TRUE on success; FALSE on failure with thread-error set.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+{
+    PCON_SLAVE NewSlave;
+
+    if (!ConpConnectSlave (ServerPid, Cookie, HandleFlags, &NewSlave)) {
+        return FALSE;
+    }
+
+    *NewHandle = ConpInsertHandle (NewSlave);
+    ConpDereferenceSlave (NewSlave);
+    return *NewHandle != NULL;
+}
+
+BOOL
 ConpInheritConsoleInformation (
     VOID
     )
+/*++
+
+Routine Description:
+
+    See whether our parent gave us information about what console
+    handles we should inherit; if so, inherit them.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    TRUE on success; FALSE on error with thread-error set.  This routine
+    succeeds if there are no handles to inherit.
+
+Environment:
+
+    DllMain.
+
+--*/
 {
     BOOL Result = FALSE;
     WCHAR StartupInfoSectionName[ARRAYSIZE (CON_STARTINFO_FORMAT)];
     HANDLE Section = NULL;
     MEMORY_BASIC_INFORMATION mbi;
     PCON_STARTUP_INFO ConStartupInfo = NULL;
+    PCON_STARTUP_HANDLE HandleInfo;
     ULONG i;
+    ULONG LargestHandle;
+    ULONG NewHandleTableSize;
+    BOOL OldHooksInhibited = ConpAreHooksInhibited;
+    PCON_SLAVE Slave;
+    ULONG ExpectedSectionSize;
+
+    ConpAreHooksInhibited = TRUE;
 
     //
     // Map the startup section into our address space.  The section
@@ -922,21 +1030,32 @@ ConpInheritConsoleInformation (
     // process.
     //
 
-    swprintf (StartupInfoSectionName,
-              CON_STARTINFO_FORMAT,
-              GetCurrentProcessId ());
+    CONP_VERIFY (
+        swprintf (StartupInfoSectionName,
+                  CON_STARTINFO_FORMAT,
+                  GetCurrentProcessId ())
+        == ARRAYSIZE (CON_STARTINFO_FORMAT) - 1);
 
     Section = OpenFileMapping (FILE_MAP_READ,
                                FALSE /* InheritHandle */,
                                StartupInfoSectionName);
 
     if (Section == NULL) {
-        if (GetLastError () == ERROR_FILE_NOT_FOUND) {
+
+        ConpTrace (L"OpenFileMapping FAILED 0x%lx [%s]",
+                   GetLastError (),
+                   StartupInfoSectionName);
+
+        if (GetLastError () == ERROR_FILE_NOT_FOUND ||
+            GetLastError () == ERROR_PATH_NOT_FOUND)
+        {
             Result = TRUE;
         }
 
         goto Out;
     }
+
+    ConpTrace (L"Found inheritance section!");
 
     ConStartupInfo = MapViewOfFile (Section, FILE_MAP_READ, 0, 0, 0);
     if (ConStartupInfo == NULL) {
@@ -944,8 +1063,9 @@ ConpInheritConsoleInformation (
     }
 
     if (VirtualQuery (ConStartupInfo, &mbi,
-                      sizeof (ConStartupInfo)) == 0)
+                      sizeof (mbi)) == 0)
     {
+        ConpTrace (L"VirtualQuery: 0x%lx", GetLastError ());
         goto Out;
     }
 
@@ -954,16 +1074,237 @@ ConpInheritConsoleInformation (
         goto Out;
     }
 
+    if (ConStartupInfo->SectionHandle) {
+        CONP_VERIFY (
+            CloseHandle (
+                LongToHandle (ConStartupInfo->SectionHandle)));
+    }
 
+    ExpectedSectionSize =
+        sizeof (*ConStartupInfo)
+        + sizeof (ConStartupInfo->Handle[0]) * ConStartupInfo->NumberHandles;
+
+    if (mbi.RegionSize < ExpectedSectionSize) {
+        ConpTrace (L"Section too small to contain claimed information");
+    }
+
+    if (ConStartupInfo->NumberHandles > 0) {
+        LargestHandle = 0;
+
+        for (i = 0; i < ConStartupInfo->NumberHandles; ++i) {
+            HandleInfo = &ConStartupInfo->Handle[i];
+            if (HandleInfo->HandleValue > LargestHandle) {
+                LargestHandle = HandleInfo->HandleValue;
+            }
+        }
+
+        NewHandleTableSize = 16;
+        while (NewHandleTableSize <= LargestHandle) {
+            NewHandleTableSize *= 2;
+        }
+
+        ConpHandleTable = LocalAlloc (LMEM_ZEROINIT, NewHandleTableSize);
+        if (ConpHandleTable == NULL) {
+            goto Out;
+        }
+
+        ConpHandleTableSize = NewHandleTableSize;
+        for (i = 0; i < ConStartupInfo->NumberHandles; ++i) {
+            HandleInfo = &ConStartupInfo->Handle[i];
+            if (!ConpConnectSlave (
+                    HandleInfo->ServerPid,
+                    HandleInfo->Cookie,
+                    HandleInfo->HandleFlags,
+                    &Slave))
+            {
+                goto Out;
+            }
+
+            ConpTrace (L"Inherited handle %p ck:%lu pipe:%p",
+                       (PVOID) ((HandleInfo->HandleValue << 16)
+                                | CON_SLAVE_TAG),
+                       Slave->Cookie,
+                       Slave->Pipe);
+
+            if (HandleInfo->DummyInheritedHandle) {
+                CONP_VERIFY (CloseHandle (
+                                 LongToHandle (
+                                     HandleInfo->DummyInheritedHandle)));
+            }
+
+            ConpHandleTable[HandleInfo->HandleValue] = Slave;
+            Slave = NULL; // Transfer reference to handle table
+        }
+
+    }
+
+    Result = TRUE;
 
   Out:
 
     if (Section != NULL) {
-        CloseHandle (Section);
+        CONP_VERIFY (CloseHandle (Section));
     }
 
     if (ConStartupInfo != NULL) {
-        UnmapViewOfFile (ConStartupInfo);
+        CONP_VERIFY (UnmapViewOfFile (ConStartupInfo));
+    }
+
+    ConpAreHooksInhibited = OldHooksInhibited;
+    return Result;
+}
+
+BOOL
+ConpPropagateInheritance (
+    HANDLE FrozenChild
+    )
+/*++
+
+Routine Description:
+
+    Propagate pseudo-console inheritance information to a child that
+    we've started CREATE_SUSPENDED.
+
+Arguments:
+
+    FrozenChild - Supplies a handle to the fresh child process.
+
+Return Value:
+
+    TRUE on success; FALSE on error with thread-error set.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+{
+    NTSTATUS nt;
+    BOOL Result = FALSE;
+    HANDLE StartupInfoSection = NULL;
+    WCHAR StartupInfoSectionName[ARRAYSIZE (CON_STARTINFO_FORMAT)];
+    ULONG i, j;
+    ULONG StartupInfoSize;
+    PCON_STARTUP_INFO ConStartupInfo = NULL;
+    PCON_STARTUP_HANDLE HandleInfo;
+    HANDLE RemoteChildHandle;
+
+    //
+    // The child opens the startup info handle by name, then closes
+    // both the handle it used in that open and the handle we dup into
+    // the child.  We dup a handle to the section into the child so
+    // that the section stays alive until the child opens it even if
+    // we go away in the meantime.
+    //
+
+    CONP_VERIFY (swprintf (StartupInfoSectionName,
+                           CON_STARTINFO_FORMAT,
+                           GetProcessId (FrozenChild))
+                 == ARRAYSIZE (CON_STARTINFO_FORMAT) - 1);
+
+    AcquireSRWLockExclusive (&ConpHandleTableLock);
+
+    //
+    // Figure out how many handles the child is inheriting.
+    //
+
+    for (i = 0, j = 0; i < ConpHandleTableSize; ++i) {
+        if (ConpHandleTable[i] &&
+            ConpHandleTable[i]->HandleFlags & HANDLE_FLAG_INHERIT)
+        {
+            j++;
+        }
+    }
+
+    ConpTrace (L"INHERIT: inheriting %u handles", j);
+
+    StartupInfoSize = (sizeof (*ConStartupInfo) +
+                       j * sizeof (ConStartupInfo->Handle[0]));
+
+    StartupInfoSection = CreateFileMapping (
+        INVALID_HANDLE_VALUE,
+        NULL /* No special security */,
+        PAGE_READWRITE,
+        0, StartupInfoSize,
+        StartupInfoSectionName);
+
+    if (!StartupInfoSection) {
+        ConpTrace (L"Could not create inheritance section 0x%lx [%s]",
+                   GetLastError (),
+                   StartupInfoSectionName);
+
+        goto Out;
+    }
+
+    //
+    // Build the inheritance information.  Note that ConStartupInfo is
+    // already zeroed when we get it from the OS.
+    //
+
+    ConStartupInfo = MapViewOfFile (StartupInfoSection,
+                                    FILE_MAP_READ | FILE_MAP_WRITE,
+                                    0, 0, 0);
+
+    if (!ConStartupInfo) {
+        goto Out;
+    }
+
+    ConStartupInfo->NumberHandles = j;
+
+    for (i = 0, j = 0; i < ConpHandleTableSize; ++i) {
+        if (ConpHandleTable[i] &&
+            ConpHandleTable[i]->HandleFlags & HANDLE_FLAG_INHERIT)
+        {
+            HandleInfo = &ConStartupInfo->Handle[j++];
+            HandleInfo->HandleValue = i;
+
+            ConpTrace (L"INHERIT: propagating handle %u", i);
+
+            if (ConpHandleTable[i]->Pipe) {
+                if (!DuplicateHandle (GetCurrentProcess (),
+                                      ConpHandleTable[i]->Pipe,
+                                      FrozenChild,
+                                      &RemoteChildHandle,
+                                      0 /* Child has no access */,
+                                      FALSE /* InheritHandle */,
+                                      0 /* Options */))
+                {
+                    goto Out;
+                }
+
+                HandleInfo->DummyInheritedHandle =
+                    HandleToLong (RemoteChildHandle);
+            }
+
+            HandleInfo->ServerPid = ConpHandleTable[i]->ServerPid;
+            HandleInfo->Cookie = ConpHandleTable[i]->Cookie;
+            HandleInfo->HandleFlags = ConpHandleTable[i]->HandleFlags;
+        }
+    }
+
+    if (!DuplicateHandle (GetCurrentProcess (),
+                          StartupInfoSection,
+                          FrozenChild,
+                          &RemoteChildHandle,
+                          GENERIC_READ,
+                          FALSE /* InheritHandle */,
+                          0 /* Options */))
+    {
+        goto Out;
+    }
+
+    ConStartupInfo->SectionHandle = HandleToLong (RemoteChildHandle);
+    Result = TRUE;
+
+  Out:
+
+    ReleaseSRWLockExclusive (&ConpHandleTableLock);
+    if (StartupInfoSection) {
+        CONP_VERIFY (CloseHandle (StartupInfoSection));
+    }
+
+    if (ConStartupInfo) {
+        CONP_VERIFY (UnmapViewOfFile (ConStartupInfo));
     }
 
     return Result;
@@ -2854,6 +3195,8 @@ HOOK (WriteConsoleOutputCharacterW, BOOL,
         lpNumberOfCharsWritten );
 }
 
+// XXX: hook other forms of CreateProcess
+
 HOOK (CreateProcessW, BOOL,
       ( LPCWSTR lpApplicationName,
         LPWSTR lpCommandLine,
@@ -2876,11 +3219,6 @@ HOOK (CreateProcessW, BOOL,
         lpStartupInfo,
         lpProcessInformation))
 {
-    //
-    // Create child suspended so we can propagate console information
-    // to it.
-    //
-
     if (CreateProcessW (lpApplicationName,
                         lpCommandLine,
                         lpProcessAttributes,
@@ -2896,16 +3234,20 @@ HOOK (CreateProcessW, BOOL,
         return FALSE;
     }
 
-    //
-    // An explicit DETACHED_PROCESS tells us not to propagate any
-    // console to the client.  CREATE_NEW_CONSOLE means to always give
-    // the child a brand new console.
-    //
+    if (!ConpPropagateInheritance (lpProcessInformation->hProcess)) {
+        ULONG SavedError = GetLastError ();
+        (VOID) TerminateProcess (lpProcessInformation->hProcess,
+                                 HRESULT_FROM_WIN32 (SavedError));
 
-    // XXX: inherit console crap!
+        CONP_VERIFY (CloseHandle (lpProcessInformation->hThread));
+        CONP_VERIFY (CloseHandle (lpProcessInformation->hProcess));
+        ZeroMemory (lpProcessInformation, sizeof (*lpProcessInformation));
+        SetLastError (SavedError);
+        return FALSE;
+    }
 
     if ((dwCreationFlags & CREATE_SUSPENDED) == 0) {
-        ResumeThread (lpProcessInformation->hThread);
+        (VOID) ResumeThread (lpProcessInformation->hThread);
     }
 
     return TRUE;

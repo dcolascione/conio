@@ -5,27 +5,35 @@
 #include <stddef.h>
 #include "conio.h"
 
-// #define CONP_ASSERT(x) assert (x)
+#ifdef NDEBUG
+# define CONP_VERIFY(x) ((x) ? TRUE : FALSE)
+# define CONP_ASSERT(x)
+#else
+# define CONP_VERIFY(x) CONP_ASSERT (x)
+# define CONP_ASSERT(x) assert (x)
+#endif
 
-#define CONP_ASSERT(x) { if ((x) == FALSE) { *((volatile char*)0) = 0; } }
-#define abort() CONP_ASSERT (0)
+// #define CONP_ASSERT(x) { if (!(x)) { *((volatile char*)0) = 0; } }
+// #define abort() CONP_ASSERT (0)
 
 //                                           PID      COOKIE
 #define CON_PIPE_FORMAT L"\\\\.\\pipe\\conio-%000008X-%000008X"
 
-//                                              CHILD_PID
-#define CON_STARTINFO_FORMAT L"Global\\conio-si-%0000008X"
+//                                      CHILDPID
+#define CON_STARTINFO_FORMAT L"conio-si-%000008X"
 
 typedef struct _CON_STARTUP_HANDLE {
-    ULONG InheritedHandle;
+    ULONG HandleValue;
+    LONG  DummyInheritedHandle;
     ULONG ServerPid;
     ULONG Cookie;
     ULONG HandleFlags;
 } CON_STARTUP_HANDLE, *PCON_STARTUP_HANDLE;
 
 typedef struct _CON_STARTUP_INFO {
-    ULONG InheritedSectionHandle;
-    CON_STARTUP_HANDLE InheritedHandles[0];
+    LONG  SectionHandle;
+    ULONG NumberHandles;
+    CON_STARTUP_HANDLE Handle[0];
 } CON_STARTUP_INFO, *PCON_STARTUP_INFO;
 
 typedef enum _CON_MESSAGE_TYPE {

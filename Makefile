@@ -51,5 +51,7 @@ conio: conio.c hook.c conio-32.dll
 		-lntdll -lpsapi
 
 clean:
-	rm -f ./*.exe ./*.dll ./*.o ./*.o64 ./*.o32 ./*.i ./*-generated.c
+	rm -f ./*.exe ./*.dll ./*.o ./*.o64 ./*.o32 ./*.i ./*-generated.c \
+		./*.stackdump
+
 

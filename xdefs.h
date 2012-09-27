@@ -105,3 +105,21 @@ typedef struct _XLDR_DATA_TABLE_ENTRY {
     };
     ULONG TimeDateStamp;
 } XLDR_DATA_TABLE_ENTRY, *PXLDR_DATA_TABLE_ENTRY;
+
+#ifndef DIRECTORY_ALL_ACCESS
+
+#define DIRECTORY_QUERY                   0x0001
+#define DIRECTORY_TRAVERSE                0x0002
+#define DIRECTORY_CREATE_OBJECT           0x0004
+#define DIRECTORY_CREATE_SUBDIRECTORY     0x0008
+#define DIRECTORY_ALL_ACCESS              (STANDARD_RIGHTS_REQUIRED | 0xF)
+
+__declspec(dllimport)
+NTSTATUS
+WINAPI
+NtCreateDirectoryObject(
+  /*OUT*/ PHANDLE  DirectoryHandle,
+  /*IN*/ ACCESS_MASK  DesiredAccess,
+  /*IN*/ POBJECT_ATTRIBUTES  ObjectAttributes);
+
+#endif /* DIRECTORY_ALL_ACCESS */

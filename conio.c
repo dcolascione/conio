@@ -55,6 +55,7 @@ main (int argc, char** argv)
 {
   PCON_MASTER master;
   HANDLE slave;
+  HANDLE slave_inherit;
 
   UNREFERENCED_PARAMETER (argc);
   UNREFERENCED_PARAMETER (argv);
@@ -79,6 +80,18 @@ main (int argc, char** argv)
   if (!slave)
     {
       fprintf (stderr, "ConMakeSlaveHandle: 0x%lx\n", GetLastError ());
+      return 1;
+    }
+
+  if (!DuplicateHandle (GetCurrentProcess (),
+                        slave,
+                        GetCurrentProcess (),
+                        &slave_inherit,
+                        0,
+                        TRUE /* InheritHandle */,
+                        DUPLICATE_SAME_ACCESS))
+    {
+      fprintf (stderr, "DuplicateHandle 0x%lx\n", GetLastError ());
       return 1;
     }
 
@@ -109,9 +122,36 @@ main (int argc, char** argv)
   }
 #endif
 
-  ConDestroyPseudoConsole (master);
+  {
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    PWSTR cmdline = wcsdup (GetCommandLine ());
 
-  execvp (argv[1], argv + 1);
-  fprintf (stderr, "execv: %s\n", strerror (errno));
-  return 127;
+    ZeroMemory (&si, sizeof (si));
+
+    while (*cmdline && !isspace (*cmdline)) ++cmdline;
+    while (*cmdline && isspace (*cmdline)) ++cmdline;
+
+    fprintf (stderr, "wtf [%S]\n", cmdline);
+
+    if (!CreateProcess (NULL,
+                        cmdline,
+                        NULL, NULL,
+                        TRUE,
+                        0 /* CreationFlags */,
+                        NULL /* Environment */,
+                        NULL /* CurrentDirectory */,
+                        &si,
+                        &pi))
+      {
+        fprintf (stderr, "CreateProcess: 0x%lx\n", GetLastError ());
+        return 1;
+      }
+
+    Sleep (10000);
+
+    WaitForSingleObject (pi.hProcess, INFINITE);
+  }
+
+  
 }
