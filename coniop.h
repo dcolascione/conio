@@ -10,12 +10,10 @@
 # define CONP_ASSERT(x)
 #else
 # define CONP_VERIFY(x) CONP_ASSERT (x)
-# define CONP_ASSERT(x) assert (x)
+//# define CONP_ASSERT(x) assert (x)
+#define CONP_ASSERT(x) { if (!(x)) { *((volatile char*)0) = 0; } }
+#define abort() CONP_ASSERT (0)
 #endif
-
-// #define CONP_ASSERT(x) { if (!(x)) { *((volatile char*)0) = 0; } }
-// #define abort() CONP_ASSERT (0)
-
 
 // XXX: handle cross-session case
 
@@ -155,3 +153,4 @@ ConpConnectSlaveHandle (
 VOID ConpTrace (PCWSTR Format, ...);
 BOOL ConpHookApis (VOID);
 
+#define MemoryBarrier() __sync_synchronize ()

@@ -2549,11 +2549,11 @@ HOOK (CreateFileA, HANDLE,
     if (lpFileName && ConpIsAttachedAsSlave ()) {
         PCWSTR MagicName;
 
-        if (!stricmp (lpFileName, "CON")) {
+        if (!lstrcmpiA (lpFileName, "CON")) {
             MagicName = L"CON";
-        } else if (!stricmp (lpFileName, "CONIN$")) {
+        } else if (!lstrcmpiA (lpFileName, "CONIN$")) {
             MagicName = L"CONIN$";
-        } else if (!stricmp (lpFileName, "CONOUT$")) {
+        } else if (!lstrcmpiA (lpFileName, "CONOUT$")) {
             MagicName = L"CONOUT$";
         } else {
             MagicName = NULL;
@@ -2605,9 +2605,9 @@ HOOK (CreateFileW, HANDLE,
     // normal CreateFileW.
     //
 
-    if (lpFileName && ( !wcsicmp (lpFileName, L"CON")     ||
-                        !wcsicmp (lpFileName, L"CONIN$")  ||
-                        !wcsicmp (lpFileName, L"CONOUT$") ))
+    if (lpFileName && ( !lstrcmpiW (lpFileName, L"CON")     ||
+                        !lstrcmpiW (lpFileName, L"CONIN$")  ||
+                        !lstrcmpiW (lpFileName, L"CONOUT$") ))
     {
         AcquireSRWLockShared (&ConpAttachedConsoleLock);
         if (ConpAttachedInput) {
@@ -2644,7 +2644,7 @@ HOOK (CreateFileW, HANDLE,
         // MSDN: the meaning of "CON" depends on desired access.
         //
 
-        if (!wcsicmp (lpFileName, L"CON")) {
+        if (!lstrcmpiW (lpFileName, L"CON")) {
             if ( (dwDesiredAccess & GENERIC_READ) &&
                  (dwDesiredAccess & GENERIC_WRITE))
             {
@@ -2666,7 +2666,7 @@ HOOK (CreateFileW, HANDLE,
         // the output buffer alive.
         //
 
-        if (!wcsicmp (lpFileName, L"CONIN$")) {
+        if (!lstrcmpiW (lpFileName, L"CONIN$")) {
             Flags |= CON_HANDLE_CONNECT_NO_OUTPUT;
         }
 
@@ -4970,6 +4970,7 @@ ConpTrace (
     PCWSTR Format,
     ...)
 {
+#if 0
     va_list Args;
     ULONG SavedError;
     static SRWLOCK TraceLock;
@@ -4986,4 +4987,6 @@ ConpTrace (
 
     ReleaseSRWLockExclusive (&TraceLock);
     SetLastError (SavedError);
+#endif
 }
+

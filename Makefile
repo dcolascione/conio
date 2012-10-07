@@ -11,6 +11,7 @@ override CFLAGS+=-std=gnu99
 override CFLAGS+=-Wno-int-to-pointer-cast
 override CFLAGS+=-Wno-pointer-to-int-cast
 override CFLAGS+=-Wno-unused
+override CFLAGS+=-mthreads
 
 all: conio conio-32.dll conio-64.dll
 
@@ -34,16 +35,20 @@ conio-client-generated.c: conio-client.c
 conio-client.o32: conio-client-generated.c
 conio-client.o64: conio-client-generated.c
 
-CONIO_SOURCES=conio-dll.c conio-client.c conio-server.c hook.c
+CONIO_SOURCES=conio-dll.c conio-client.c conio-server.c hook.c fakecrt.c
 
 conio-32.dll: override CPPFLAGS+=-DCONIO_BUILDING_DLL
 conio-64.dll: override CPPFLAGS+=-DCONIO_BUILDING_DLL
 
+CONIO_DLL_LDFLAGS=-nostdlib -lgcc_eh -lkernel32 -lntdll -lgcc -luser32 -lmingwex 
+
 conio-32.dll: $(CONIO_SOURCES:%.c=%.o32)
-	$(MINGW32CC) -shared -o $@ $^ -lntdll
+	$(MINGW32CC) -shared -o $@ $^ $(CONIO_DLL_LDFLAGS) \
+		-Wl,-e,_DllMain@12
 
 conio-64.dll: $(CONIO_SOURCES:%.c=%.o64)
-	$(MINGW64CC) -shared -o $@ $^ -lntdll
+	$(MINGW64CC) -shared -o $@ $^ $(CONIO_DLL_LDFLAGS) \
+		-Wl,-e,DllMain
 
 conio: conio.c hook.c conio-32.dll
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ \
