@@ -5,6 +5,7 @@
 #include "coniop.h"
 #include "hook.h"
 #include "xdefs.h"
+#include "miniddk.h"
 
 //
 // This file hooks many Win32 functions in order to create the
@@ -50,6 +51,14 @@ static __thread BOOL ConpAreHooksInhibited;
 #define CON_SLAVE_TAG 0x1201
 
 //
+// Similarly, these values match Win32's fake-console handles.  It's
+// important that our pseudo-console handles do _not_ match.
+//
+
+#define CON_W32_MASK 0x10000003
+#define CON_W32_TAG  0x00000003
+
+//
 // CON_SLAVE holds information pertaining to one console handle.
 //
 
@@ -65,10 +74,10 @@ typedef struct _CON_SLAVE {
     LONG ReferenceCount;
 
     //
-    // See {Get,Set}HandleInformation
+    // See coniop.h.
     //
 
-    ULONG HandleFlags;
+    ULONG Flags;
 
     //
     // Communication with the server happens over this pipe.  WHEN WE
@@ -96,11 +105,80 @@ typedef struct _CON_SLAVE {
 
 } CON_SLAVE, *PCON_SLAVE;
 
-static SRWLOCK ConpHandleTableLock = SRWLOCK_INIT;
+typedef struct _CON_SHADOW_ATTRIBUTE {
+    LIST_ENTRY AttributeLink;
+    DWORD Flags;
+    DWORD_PTR Attribute;
+    PVOID Value;
+    SIZE_T Size;
+} CON_SHADOW_ATTRIBUTE, *PCON_SHADOW_ATTRIBUTE;
+
+typedef struct _CON_SHADOW_ATTRIBUTE_LIST {
+    LIST_ENTRY ShadowAttributeLink;
+    LPPROC_THREAD_ATTRIBUTE_LIST AttributeList;
+    ULONG AttributeCount;
+    ULONG Flags;
+    SIZE_T Size;
+    PCON_SLAVE ChildAttach;
+    LIST_ENTRY Attributes;
+    HANDLE* ParentProcess; // XXX
+} CON_SHADOW_ATTRIBUTE_LIST, *PCON_SHADOW_ATTRIBUTE_LIST;
+
+//
+// Lock order:
+//
+// ConpShadowAttributeLock
+// ConpAttachedConsoleLock
+// ConpHandleTableLock
+// Individual slave pipelocks
+//
+
+//
+// Maintain a list of shadow structures for every undeleted
+// PROC_THREAD_ATTRIBUTE_LIST.  We store in these shadow structures a
+// copy of the inherited handle table and a reference to the slave we
+// should inherit.
+//
+
+static SRWLOCK ConpShadowAttributeLock;
+static LIST_ENTRY ConpShadowAttributes = {
+    &ConpShadowAttributes,
+    &ConpShadowAttributes
+};
+
+//
+// This lock governs all access to ConpAttachedInput.
+//
+
+static SRWLOCK ConpAttachedConsoleLock;
+static PCON_SLAVE ConpAttachedInput;
+static HANDLE ConpAttachedStdin;
+static HANDLE ConpAttachedStdout;
+static HANDLE ConpAttachedStderr;
+static BOOL ConpIsAnyConsoleAttached;
+
+static SRWLOCK ConpHandleTableLock;
 static PCON_SLAVE* ConpHandleTable;
 static ULONG ConpHandleTableSize; // In elements
 
-static HANDLE ConpAttachedConsole;
+static
+BOOL
+ConpAttachConsole (
+    /* In */ ULONG ServerPid,
+    /* In */ ULONG Cookie
+    );
+
+static
+HANDLE
+ConpIndexToHandle (
+    ULONG Index
+    );
+
+static
+ULONG
+ConpHandleToIndex (
+    HANDLE Handle
+    );
 
 static
 BOOL
@@ -133,6 +211,70 @@ Environment:
 }
 
 static
+BOOL
+ConpIsWindowsConsole (
+    HANDLE Handle
+    )
+/*++
+
+Routine Description:
+
+    Determine whether the given handle might be a console handle from
+    the Win32 userspace console layer.
+
+Arguments:
+
+    Handle - Supplies a handle to test.
+
+Return Value:
+
+    TRUE if the handle is probably a Windows console handle.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+{
+    return ((ULONG) Handle & CON_W32_MASK) == CON_W32_TAG;
+}
+
+static
+BOOL
+ConpIsAttachedAsSlave (
+    VOID
+    )
+/*++
+
+Routine Description:
+
+    This routine determines whether the current process is attached to
+    a pseudo-console.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    TRUE if attached; FALSE otherwise.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+{
+    BOOL IsAttached;
+
+    AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+    IsAttached = (ConpAttachedInput != NULL);
+    ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    return IsAttached;
+}
+
+static
 PCON_SLAVE
 ConpReferenceSlaveHandle (
     HANDLE SlaveHandle
@@ -161,9 +303,7 @@ Environment:
     ULONG Index;
     PCON_SLAVE Slave = NULL;
 
-    CONP_ASSERT (ConpIsSlave (SlaveHandle));
-
-    Index = (ULONG) SlaveHandle >> 16;
+    Index = ConpHandleToIndex (SlaveHandle);
 
     //
     // Take the handle table lock so the operation of referencing the
@@ -171,21 +311,66 @@ Environment:
     // protecting us from a concurrent close of the handle.
     //
 
+    AcquireSRWLockExclusive (&ConpHandleTableLock);
     if (Index < ConpHandleTableSize) {
-        AcquireSRWLockExclusive (&ConpHandleTableLock);
         Slave = ConpHandleTable[Index];
         if (Slave != NULL) {
             InterlockedIncrement (&Slave->ReferenceCount);
         }
 
-        ReleaseSRWLockExclusive (&ConpHandleTableLock);
     }
 
+    ReleaseSRWLockExclusive (&ConpHandleTableLock);
     if (Slave == NULL) {
         SetLastError (ERROR_INVALID_HANDLE);
     }
 
     return Slave;
+}
+
+static
+PCON_SLAVE
+ConpReferenceAttachedConsole (
+    VOID
+    )
+/*++
+
+Routine Description:
+
+    This routine returns a reference to the currently-attached console
+    input queue.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    Pointer to slave object on success; on error, NULL with
+    thread-error set.
+
+Environment:
+
+    Call without locks held.
+
+--*/
+{
+    PCON_SLAVE AttachedInput = NULL;
+
+    AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    AttachedInput = ConpAttachedInput;
+    if (AttachedInput) {
+        InterlockedIncrement (&AttachedInput->ReferenceCount);
+    }
+
+    ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    if (AttachedInput == NULL) {
+        SetLastError (ERROR_INVALID_HANDLE); // XXX Same as Windows?
+    }
+
+    return AttachedInput;
 }
 
 static
@@ -223,7 +408,7 @@ Environment:
             CONP_VERIFY (CloseHandle (Slave->Pipe));
         }
 
-        CONP_VERIFY (LocalFree (Slave));
+        CONP_VERIFY (!LocalFree (Slave));
     }
 }
 
@@ -259,21 +444,16 @@ Environment:
     BOOL Result;
     PCON_SLAVE Slave;
 
-    CONP_ASSERT (ConpIsSlave (SlaveHandle));
-
-    Index = (ULONG) SlaveHandle >> 16;
+    Index = ConpHandleToIndex (SlaveHandle);
     Slave = NULL;
 
     AcquireSRWLockExclusive (&ConpHandleTableLock);
 
     if (Index < ConpHandleTableSize) {
         Slave = ConpHandleTable[Index];
-        if (Slave->HandleFlags & HANDLE_FLAG_PROTECT_FROM_CLOSE) {
-            ReleaseSRWLockExclusive (&ConpHandleTableLock);
-            return TRUE;
+        if ((Slave->Flags & CON_HANDLE_PROTECT_FROM_CLOSE) == 0) {
+            ConpHandleTable[Index] = NULL;
         }
-
-        ConpHandleTable[Index] = NULL;
     }
 
     ReleaseSRWLockExclusive (&ConpHandleTableLock);
@@ -283,7 +463,10 @@ Environment:
         return FALSE;
     }
 
-    ConpDereferenceSlave (Slave);
+    if ((Slave->Flags & CON_HANDLE_PROTECT_FROM_CLOSE) == 0) {
+        ConpDereferenceSlave (Slave);
+    }
+
     return TRUE;
 }
 
@@ -360,7 +543,7 @@ Environment:
     ConpHandleTable[FreeEntry] = Slave;
     InterlockedIncrement (&Slave->ReferenceCount);
     ReleaseSRWLockExclusive (&ConpHandleTableLock);
-    return (HANDLE) ( (FreeEntry << 16) | CON_SLAVE_TAG );
+    return ConpIndexToHandle (FreeEntry);
 }
 
 static
@@ -368,6 +551,8 @@ BOOL
 ConpDuplicateSlaveHandle (
     HANDLE Source,
     HANDLE* Destination,
+    ULONG DesiredAccess,
+    ULONG DuplicateOptions,
     BOOL Inherit
     )
 /*++
@@ -383,6 +568,10 @@ Arguments:
 
     Destination - Receives, on success, the duplicated handle.
 
+    DesiredAccess - Supplies the access desired to the new handle.
+
+    DuplicateOptions - See DuplicateHandle.
+
     Inherit - Indicates whether the new handle is marked inheritable.
 
 Return Value:
@@ -395,27 +584,72 @@ Environment:
 
 --*/
 {
-    PCON_SLAVE ExistingSlave;
-    HANDLE NewSlaveHandle;
     BOOL Result = FALSE;
+    HANDLE NewSlaveHandle;
+    ULONG Index;
+    ULONG NewFlags;
+    PCON_SLAVE ExistingSlave = NULL;
 
-    ExistingSlave = ConpReferenceSlaveHandle (Source);
+    //
+    // When the caller gives us DUPLICATE_CLOSE_SOURCE, we need to
+    // atomically duplicate the original handle and close the
+    // original, and we need to make sure the original is closed even
+    // if the operation fails.  To implement these semantics, we need
+    // to manually probe the handle table instead of relying on
+    // ConpReferenceSlaveHandle followed by a ConpCloseSlaveHandle ---
+    // someone could sneak in between the two calls and change the
+    // meaning of the handle.
+    //
+
+    AcquireSRWLockExclusive (&ConpHandleTableLock);
+
+    Index = ConpHandleToIndex (Source);
+    if (Index < ConpHandleTableSize) {
+        ExistingSlave = ConpHandleTable[Index];
+        if (ExistingSlave != NULL) {
+            if (DuplicateOptions & DUPLICATE_CLOSE_SOURCE) {
+                ConpHandleTable[Index] = NULL; // Transfer reference
+            } else {
+                InterlockedIncrement (&ExistingSlave->ReferenceCount);
+            }
+        }
+    }
+
+    ReleaseSRWLockExclusive (&ConpHandleTableLock);
+
     if (ExistingSlave == NULL) {
+        SetLastError (ERROR_INVALID_HANDLE);
         goto Out;
     }
 
-    ConpTrace (L"DUP: Existing handle %p", Source);
+    if (DuplicateOptions & DUPLICATE_SAME_ACCESS) {
+        NewFlags = ExistingSlave->Flags & (CON_HANDLE_READ_ACCESS |
+                                           CON_HANDLE_WRITE_ACCESS );
+    } else {
+        NewFlags = 0;
+
+        if (DesiredAccess & GENERIC_READ) {
+            NewFlags |= CON_HANDLE_READ_ACCESS;
+        }
+
+        if (DesiredAccess & GENERIC_WRITE) {
+            NewFlags |= CON_HANDLE_WRITE_ACCESS;
+        }
+    }
+
+    if (Inherit) {
+        NewFlags |= CON_HANDLE_INHERIT;
+    }
 
     if (!ConpConnectSlaveHandle (ExistingSlave->ServerPid,
                                  ExistingSlave->Cookie,
-                                 Inherit ? HANDLE_FLAG_INHERIT : 0,
+                                 NewFlags,
                                  &NewSlaveHandle))
     {
         goto Out;
     }
 
     *Destination = NewSlaveHandle;
-    ConpTrace (L"DUP: New handle %p", *Destination);
     Result = TRUE;
 
   Out:
@@ -604,6 +838,12 @@ Environment:
     if (Slave->Pipe == NULL) {
         ReleaseSRWLockExclusive (&Slave->PipeLock);
         SetLastError (ERROR_BROKEN_PIPE);
+
+        //
+        // XXX: "Headless mode" where we handle some requests even if
+        // the server is dead.
+        //
+
         return FALSE;
     }
 
@@ -635,7 +875,7 @@ Environment:
         goto ProtocolError;
     }
 
-    ConpTrace (L"CLIENT: recv header ck:%lu size:%lu type:%lu",
+    ConpTrace (L"CLIENT: recv ck:%lu size:%lu type:%lu",
                Slave->Cookie, Message->Size, Message->Type);
 
     //
@@ -652,7 +892,8 @@ Environment:
             goto ProtocolError;
         }
 
-        ConpTrace (L"Error reply. Code: 0x%lx", Message->ErrorReply.ErrorCode);
+        ConpTrace (L"Error reply. Code: 0x%lx",
+                   Message->ErrorReply.ErrorCode);
 
         ReleaseSRWLockExclusive (&Slave->PipeLock);
         SetLastError (Message->ErrorReply.ErrorCode);
@@ -857,7 +1098,7 @@ BOOL
 ConpConnectSlave (
     /* In */  ULONG ServerPid,
     /* In */  ULONG Cookie,
-    /* In */  ULONG HandleFlags,
+    /* In */  ULONG Flags,
     /* Out */ PCON_SLAVE* NewSlave
     )
 /*++
@@ -874,7 +1115,7 @@ Arguments:
 
     Cookie - Supplies a server-allocated opaque ID for the handle.
 
-    HandleFlags - Supplies handle flags; see GetHandleInformation.
+    Flags - Supplies handle flags.
 
     NewSlave - Receives a new slave on success.  The new slave has a
                reference count of one.
@@ -890,9 +1131,10 @@ Environment:
 --*/
 {
     WCHAR PipeName[ARRAYSIZE (CON_PIPE_FORMAT)];
-    PCON_SLAVE Slave = NULL;
+    PCON_SLAVE Slave;
     BOOL Result = FALSE;
     HANDLE LocalNewHandle;
+    CON_MESSAGE Message;
 
     Slave = LocalAlloc (LMEM_ZEROINIT, sizeof (*Slave));
     if (Slave == NULL) {
@@ -900,6 +1142,9 @@ Environment:
     }
 
     Slave->ReferenceCount = 1;
+    Slave->Cookie = Cookie;
+    Slave->ServerPid = ServerPid;
+    Slave->Flags = Flags;
 
     CONP_VERIFY (swprintf (PipeName, CON_PIPE_FORMAT, ServerPid, Cookie)
                  == ARRAYSIZE (CON_PIPE_FORMAT) - 1);
@@ -922,9 +1167,32 @@ Environment:
         //
     }
 
-    Slave->Cookie = Cookie;
-    Slave->ServerPid = ServerPid;
-    Slave->HandleFlags = HandleFlags;
+    //
+    // Tell the server what kind of handle we have.
+    //
+
+    ZeroMemory (&Message, CON_MESSAGE_SIZE (InitializeConnection));
+    Message.Size = CON_MESSAGE_SIZE (InitializeConnection);
+    Message.Type = ConMsgInitializeConnection;
+    Message.InitializeConnection.Flags = Flags;
+
+    if (ConpExchangeMessage (
+            Slave, &Message,
+            Message.Size,
+            NULL,
+            ConReplyInitializeConnection,
+            CON_MESSAGE_SIZE (InitializeConnectionReply),
+            NULL, 0)
+        == FALSE)
+    {
+        goto Out;
+    }
+
+    ConpTrace (L"CLIENT: connected ck:%lu nck:%lu",
+               Slave->Cookie,
+               Message.InitializeConnectionReply.NewCookie);
+
+    Slave->Cookie = Message.InitializeConnectionReply.NewCookie;
     *NewSlave = Slave;
     Slave = NULL;
     Result = TRUE;
@@ -942,7 +1210,7 @@ BOOL
 ConpConnectSlaveHandle (
     /* In */  ULONG ServerPid,
     /* In */  ULONG Cookie,
-    /* In */  ULONG HandleFlags,
+    /* In */  ULONG Flags,
     /* Out */ HANDLE* NewHandle
     )
 /*++
@@ -958,7 +1226,7 @@ Arguments:
 
     Cookie - Supplies a server-allocated opaque ID for the handle.
 
-    HandleFlags - Supplies handle flags; see GetHandleInformation.
+    Flags - Supplies handle flags.
 
     NewHandle - Receives a new slave handle on success.
 
@@ -974,7 +1242,7 @@ Environment:
 {
     PCON_SLAVE NewSlave;
 
-    if (!ConpConnectSlave (ServerPid, Cookie, HandleFlags, &NewSlave)) {
+    if (!ConpConnectSlave (ServerPid, Cookie, Flags, &NewSlave)) {
         return FALSE;
     }
 
@@ -1074,6 +1342,11 @@ Environment:
         goto Out;
     }
 
+    if (ConStartupInfo->Version != CON_SHARED_DATA_VERSION) {
+        SetLastError (ERROR_PRODUCT_VERSION);
+        goto Out;
+    }
+
     if (ConStartupInfo->SectionHandle) {
         CONP_VERIFY (
             CloseHandle (
@@ -1082,11 +1355,16 @@ Environment:
 
     ExpectedSectionSize =
         sizeof (*ConStartupInfo)
-        + sizeof (ConStartupInfo->Handle[0]) * ConStartupInfo->NumberHandles;
+        + sizeof (ConStartupInfo->Handle[0]) *
+        ConStartupInfo->NumberHandles;
 
     if (mbi.RegionSize < ExpectedSectionSize) {
         ConpTrace (L"Section too small to contain claimed information");
     }
+
+    //
+    // Learn about any handles the parent gave us.
+    //
 
     if (ConStartupInfo->NumberHandles > 0) {
         LargestHandle = 0;
@@ -1114,15 +1392,14 @@ Environment:
             if (!ConpConnectSlave (
                     HandleInfo->ServerPid,
                     HandleInfo->Cookie,
-                    HandleInfo->HandleFlags,
+                    HandleInfo->Flags,
                     &Slave))
             {
                 goto Out;
             }
 
             ConpTrace (L"Inherited handle %p ck:%lu pipe:%p",
-                       (PVOID) ((HandleInfo->HandleValue << 16)
-                                | CON_SLAVE_TAG),
+                       ConpIndexToHandle (HandleInfo->HandleValue),
                        Slave->Cookie,
                        Slave->Pipe);
 
@@ -1135,7 +1412,31 @@ Environment:
             ConpHandleTable[HandleInfo->HandleValue] = Slave;
             Slave = NULL; // Transfer reference to handle table
         }
+    }
 
+    //
+    // If we inherited our parent's console, try attaching to it.
+    //
+
+    if (ConStartupInfo->AttachConsoleHandle) {
+        ConpTrace (L"Attach handle %p",
+                   ConStartupInfo->AttachConsoleHandle);
+
+        FreeConsole ();
+        Slave = ConpReferenceSlaveHandle (
+            ConStartupInfo->AttachConsoleHandle);
+
+        ConpCloseSlaveHandle (ConStartupInfo->AttachConsoleHandle);
+
+        if (Slave) {
+            AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+            (VOID) ConpAttachConsole (Slave->ServerPid, Slave->Cookie);
+            ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+            ConpDereferenceSlave (Slave);
+            Slave = NULL;
+        }
+
+        ConpTrace (L"getout: %p", GetStdHandle (STD_OUTPUT_HANDLE));
     }
 
     Result = TRUE;
@@ -1150,13 +1451,61 @@ Environment:
         CONP_VERIFY (UnmapViewOfFile (ConStartupInfo));
     }
 
+    if (Slave != NULL) {
+        ConpDereferenceSlave (Slave);
+    }
+
     ConpAreHooksInhibited = OldHooksInhibited;
     return Result;
 }
 
+static
+BOOL
+ConpIsHandleInList (
+    HANDLE Needle,
+    HANDLE* Haystack,
+    SIZE_T HaystackLength
+    )
+{
+    SIZE_T i;
+
+    for (i = 0 ; i < HaystackLength; ++i) {
+        if (Haystack[i] == Needle) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static
+HANDLE
+ConpIndexToHandle (
+    ULONG Index
+    )
+{
+    return (HANDLE) ( (Index << 16) | CON_SLAVE_TAG );
+}
+
+static
+ULONG
+ConpHandleToIndex (
+    HANDLE Handle
+    )
+{
+    CONP_ASSERT (ConpIsSlave (Handle));
+
+    return (ULONG) Handle >> 16;
+}
+
+static
 BOOL
 ConpPropagateInheritance (
-    HANDLE FrozenChild
+    HANDLE FrozenChild,
+    PCON_SLAVE ChildAttach,
+    BOOL HandleListPresent,
+    HANDLE* HandleList,
+    SIZE_T HandleListLength
     )
 /*++
 
@@ -1169,13 +1518,26 @@ Arguments:
 
     FrozenChild - Supplies a handle to the fresh child process.
 
+    ChildAttach - Supplies a slave connected to the console to which
+                  FrozenChild will attach itself.
+
+    HandleListPresent - Supplies an indication of whether HandleList
+                        contains a limiting set of handles for
+                        inheritance.
+
+    HandleList - Supplies a pointer to a list of HandleListLength
+                 handles.  Only handles in the list will be inherited.
+
+    HandleListLength - Supplies the number of handles in the buffer to
+                       which HandleList points.
+
 Return Value:
 
     TRUE on success; FALSE on error with thread-error set.
 
 Environment:
 
-    Arbitrary.
+    Call without locks held.
 
 --*/
 {
@@ -1188,6 +1550,9 @@ Environment:
     PCON_STARTUP_INFO ConStartupInfo = NULL;
     PCON_STARTUP_HANDLE HandleInfo;
     HANDLE RemoteChildHandle;
+    HANDLE ChildAttachHandle = NULL;
+    ULONG ChildAttachIndex = -1;
+    BOOL HandleTableLockHeld = FALSE;
 
     //
     // The child opens the startup info handle by name, then closes
@@ -1202,21 +1567,42 @@ Environment:
                            GetProcessId (FrozenChild))
                  == ARRAYSIZE (CON_STARTINFO_FORMAT) - 1);
 
+    if (ChildAttach) {
+        ChildAttachHandle = ConpInsertHandle (ChildAttach);
+        if (!ChildAttachHandle) {
+            goto Out;
+        }
+
+        ChildAttachIndex = ConpHandleToIndex (ChildAttachHandle);
+    }
+
+#define SHOULD_INHERIT(idx)                                          \
+    (i == ChildAttachIndex ||                                        \
+     (ConpHandleTable[i]                                             \
+      && (ConpHandleTable[i]->Flags & CON_HANDLE_INHERIT)            \
+      && (HandleListPresent == FALSE ||                              \
+          ConpIsHandleInList (ConpIndexToHandle (i),                 \
+                              HandleList,                            \
+                              HandleListLength))))
+
     AcquireSRWLockExclusive (&ConpHandleTableLock);
+    HandleTableLockHeld = TRUE;
 
     //
     // Figure out how many handles the child is inheriting.
     //
 
     for (i = 0, j = 0; i < ConpHandleTableSize; ++i) {
-        if (ConpHandleTable[i] &&
-            ConpHandleTable[i]->HandleFlags & HANDLE_FLAG_INHERIT)
-        {
+        if (SHOULD_INHERIT (i)) {
             j++;
         }
     }
 
-    ConpTrace (L"INHERIT: inheriting %u handles", j);
+    ConpTrace (L"INHERIT: nr:%u hlp:%lu", j, HandleListPresent);
+    ConpTrace (L"PID is %lu sleeping for 10s...",
+               GetProcessId (FrozenChild));
+
+    Sleep (10000);
 
     StartupInfoSize = (sizeof (*ConStartupInfo) +
                        j * sizeof (ConStartupInfo->Handle[0]));
@@ -1249,12 +1635,18 @@ Environment:
         goto Out;
     }
 
+    ConStartupInfo->Version = CON_SHARED_DATA_VERSION;
+
+    if (ChildAttachHandle) {
+        ConStartupInfo->AttachConsoleHandle = ChildAttachHandle;
+    }
+
+    ConpTrace (L"ChildAttachHandle: %p", ChildAttachHandle);
+
     ConStartupInfo->NumberHandles = j;
 
     for (i = 0, j = 0; i < ConpHandleTableSize; ++i) {
-        if (ConpHandleTable[i] &&
-            ConpHandleTable[i]->HandleFlags & HANDLE_FLAG_INHERIT)
-        {
+        if (SHOULD_INHERIT (i)) {
             HandleInfo = &ConStartupInfo->Handle[j++];
             HandleInfo->HandleValue = i;
 
@@ -1278,7 +1670,7 @@ Environment:
 
             HandleInfo->ServerPid = ConpHandleTable[i]->ServerPid;
             HandleInfo->Cookie = ConpHandleTable[i]->Cookie;
-            HandleInfo->HandleFlags = ConpHandleTable[i]->HandleFlags;
+            HandleInfo->Flags = ConpHandleTable[i]->Flags;
         }
     }
 
@@ -1298,13 +1690,795 @@ Environment:
 
   Out:
 
-    ReleaseSRWLockExclusive (&ConpHandleTableLock);
+    if (HandleTableLockHeld) {
+        ReleaseSRWLockExclusive (&ConpHandleTableLock);
+    }
+
     if (StartupInfoSection) {
         CONP_VERIFY (CloseHandle (StartupInfoSection));
     }
 
     if (ConStartupInfo) {
         CONP_VERIFY (UnmapViewOfFile (ConStartupInfo));
+    }
+
+    if (ChildAttachHandle) {
+        CONP_VERIFY (ConpCloseSlaveHandle (ChildAttachHandle));
+    }
+
+    return Result;
+
+#undef SHOULD_INHERIT
+
+}
+
+static
+PCON_ATTACH_SHARED
+ConpMapAttachShared (
+    VOID
+    )
+/*++
+
+Routine Description:
+
+    This routine returns a pointer to the shared section describing
+    the console (if any) to which the current process is attached.
+    The section is created lazily the first time this routine is
+    called and persists until the current process exits.
+
+    Each call to this function re-maps the shared section.  The caller
+    must unmap this view by calling UnmapViewOfFile.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    On success, a pointer to the shared information.  On error,
+    NULL with thread-error set.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+{
+    static SRWLOCK Lock;
+    static HANDLE AttachSection;
+    static BOOL First;
+
+    PCON_ATTACH_SHARED AttachShared = NULL;
+    WCHAR AttachSectionName[ARRAYSIZE (CON_ATTACHINFO_FORMAT)+1];
+
+    AcquireSRWLockExclusive (&Lock);
+
+    if (AttachSection == NULL) {
+        CONP_VERIFY (swprintf (AttachSectionName,
+                               CON_ATTACHINFO_FORMAT,
+                               GetCurrentProcessId ())
+                     == ARRAYSIZE (CON_ATTACHINFO_FORMAT) - 1);
+
+        AttachSection = CreateFileMapping (
+            INVALID_HANDLE_VALUE,
+            NULL /* No special security */,
+            PAGE_READWRITE,
+            0,
+            sizeof (*AttachShared),
+            AttachSectionName);
+
+        if (AttachSection == NULL) {
+            goto Out;
+        }
+    }
+
+    AttachShared = MapViewOfFile (AttachSection,
+                                  FILE_MAP_READ | FILE_MAP_WRITE,
+                                  0, 0, /* Low, High offsets */
+                                  0 /* Map whole section */);
+
+    if (AttachShared == NULL) {
+        goto Out;
+    }
+
+    if (First == FALSE) {
+        First = TRUE;
+        AttachShared->Version = CON_SHARED_DATA_VERSION;
+    }
+
+  Out:
+
+    ReleaseSRWLockExclusive (&Lock);
+    return AttachShared;
+}
+
+static
+VOID
+ConpUpdateAttachInfo (
+    PCON_ATTACH_SHARED AttachShared,
+    CON_ATTACH_INFO AttachInfo
+    )
+/*++
+
+Routine Description:
+
+    This routine updates the attachment information exported to other
+    processes by setting it to AttachInfo in such a way that other
+    processes read atomic snapshots of the attachment information.
+
+Arguments:
+
+    AttachShared - Supplies a view of the shared memory region.
+
+    AttachInfo - Supplies the information to export.
+
+Return Value:
+
+    None.
+
+Environment:
+
+    Serialize all calls to this routine.
+
+--*/
+{
+    memcpy (&AttachShared->Info[!(AttachShared->Sequence & 1)],
+            &AttachInfo,
+            sizeof (AttachInfo));
+
+    MemoryBarrier ();
+    AttachShared->Sequence += 1;
+}
+
+static
+BOOL
+ConpReadAttachInfo (
+    ULONG ProcessId,
+    PCON_ATTACH_INFO AttachInfo
+    )
+/*++
+
+Routine Description:
+
+    This routine reads the process attachment information
+    for the given process.
+
+Arguments:
+
+    ProcessId - Supplies the PID of the process to inspect.
+
+    AttachInfo - Receives the attachment information.
+
+Return Value:
+
+    TRUE on success; FALSE on error with thread-error set.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+{
+    BOOL Result = FALSE;
+    HANDLE AttachSection = NULL;
+    PCON_ATTACH_SHARED AttachShared = NULL;
+    MEMORY_BASIC_INFORMATION mbi;
+    WCHAR AttachSectionName[ARRAYSIZE (CON_ATTACHINFO_FORMAT)+1];
+    ULONG Sequence;
+
+    CONP_VERIFY (swprintf (AttachSectionName,
+                           CON_ATTACHINFO_FORMAT,
+                           ProcessId)
+                 == ARRAYSIZE (CON_ATTACHINFO_FORMAT) - 1);
+
+    AttachSection = OpenFileMapping (PAGE_READONLY,
+                                     FALSE /* Inherit */,
+                                     AttachSectionName);
+
+    if (AttachSection == NULL) {
+
+        //
+        // If the given process doesn't have an attach-info section,
+        // we consider that successfully reading an attach information
+        // block of all zero.
+        //
+
+        if (GetLastError () == ERROR_FILE_NOT_FOUND ||
+            GetLastError () == ERROR_PATH_NOT_FOUND)
+        {
+            ZeroMemory (AttachInfo, sizeof (*AttachInfo));
+            Result = TRUE;
+        }
+
+        goto Out;
+    }
+
+    AttachShared = MapViewOfFile (
+        AttachSection,
+        FILE_MAP_READ,
+        0, 0, 0);
+
+    if (AttachShared == NULL) {
+        goto Out;
+    }
+
+    if (!VirtualQuery (AttachShared, &mbi, sizeof (mbi))) {
+        goto Out;
+    }
+
+    if (mbi.RegionSize < sizeof (*AttachShared)) {
+        SetLastError (ERROR_INVALID_DATA);
+        goto Out;
+    }
+
+    if (AttachShared->Version == 0) { // Not initialized
+        ZeroMemory (AttachInfo, sizeof (*AttachInfo));
+        Result = TRUE;
+        goto Out;
+    }
+
+    if (AttachShared->Version != CON_SHARED_DATA_VERSION) {
+        SetLastError (ERROR_PRODUCT_VERSION);
+        goto Out;
+    }
+
+    //
+    // If the sequence at the start of the copy doesn't match the
+    // sequence at the end of the copy, the other process was updating
+    // the shared information while we copied it.  Try again.
+    //
+
+    do {
+        Sequence = AttachShared->Sequence;
+        MemoryBarrier ();
+        memcpy (AttachInfo,
+                &AttachShared->Info[Sequence & 1],
+                sizeof (*AttachInfo));
+
+        MemoryBarrier ();
+    } while (Sequence != AttachShared->Sequence &&
+             (Sleep (0), TRUE));
+
+    Result = TRUE;
+
+  Out:
+
+    if (AttachSection) {
+        CONP_VERIFY (CloseHandle (AttachSection));
+    }
+
+    if (AttachShared) {
+        CONP_VERIFY (UnmapViewOfFile (AttachShared));
+    }
+
+    return Result;
+
+}
+
+static
+ULONG
+ConpSlaveCookie (
+    HANDLE SlaveHandle
+    )
+{
+    PCON_SLAVE Slave = ConpReferenceSlaveHandle (SlaveHandle);
+    ULONG Cookie;
+
+    CONP_ASSERT (Slave);
+    Cookie = Slave->Cookie;
+    ConpDereferenceSlave (Slave);
+    return Cookie;
+}
+
+static
+BOOL
+ConpAttachConsole (
+    /* In */ ULONG ServerPid,
+    /* In */ ULONG Cookie
+    )
+/*++
+
+Routine Description:
+
+    This routine attaches to the given console.
+
+Arguments:
+
+    ServerPid - Supplies the PID of the server hosting the
+                pseudo-console.
+
+    Cookie - Supplies the cookie corresponding to any
+             object in the given console.
+
+Return Value:
+
+    TRUE on success; FALSE on failure with thread-error set.
+
+Environment:
+
+    Call with ConpAttachedConsoleLock held.  The current process must
+    not be attached to a console.
+
+--*/
+{
+    BOOL Result = FALSE;
+    STARTUPINFO si;
+    PCON_SLAVE AttachSlave = NULL;
+    PCON_ATTACH_SHARED AttachShared = NULL;
+    CON_ATTACH_INFO AttachInfo;
+
+    HANDLE ReplacementStdin = NULL;
+    HANDLE ReplacementStdout = NULL;
+    HANDLE ReplacementStderr = NULL;
+
+    BOOL NeedNewStdout;
+    BOOL NeedNewStderr;
+
+    PXPEB Peb;
+    XPROCESS_BASIC_INFORMATION Bi;
+
+    CONP_ASSERT (ConpIsAnyConsoleAttached == FALSE);
+    CONP_ASSERT (ConpAttachedInput == NULL);
+    CONP_ASSERT (ConpAttachedStdin == NULL);
+    CONP_ASSERT (ConpAttachedStdout == NULL);
+    CONP_ASSERT (ConpAttachedStderr == NULL);
+
+    GetStartupInfo (&si);
+
+    CONP_VERIFY (
+        NT_SUCCESS (
+            NtQueryInformationProcess (
+                GetCurrentProcess (),
+                ProcessBasicInformation,
+                &Bi,
+                sizeof (Bi),
+                NULL)));
+
+    Peb = (PXPEB) Bi.PebBaseAddress;
+
+    //
+    // Make sure we'll be able to export attachment information to
+    // other processes.
+    //
+
+    AttachShared = ConpMapAttachShared ();
+    if (AttachShared == NULL) {
+        goto Out;
+    }
+
+    //
+    // Figure out which standard handles we'll replace.  If we're
+    // going to replace a standard handle, perform the connection to
+    // the console server _before_ we do the
+    // CON_HANDLE_CONNECT_ATTACHED connection: this way, if something
+    // goes wrong, we don't show up as briefly attached to the
+    // console.
+    //
+
+    if ((si.dwFlags & STARTF_USESTDHANDLES) == 0 ||
+        GetStdHandle (STD_INPUT_HANDLE) == NULL ||
+        ConpIsWindowsConsole (GetStdHandle (STD_INPUT_HANDLE)))
+    {
+        if (!ConpConnectSlaveHandle (ServerPid,
+                                     Cookie,
+                                     ( CON_HANDLE_READ_ACCESS |
+                                       CON_HANDLE_CONNECT_NO_OUTPUT ),
+                                     &ReplacementStdin))
+        {
+            goto Out;
+        }
+    }
+
+    NeedNewStdout = ((si.dwFlags & STARTF_USESTDHANDLES) == 0 ||
+                     GetStdHandle (STD_OUTPUT_HANDLE) == NULL ||
+                     ConpIsWindowsConsole (GetStdHandle (STD_OUTPUT_HANDLE)));
+
+    NeedNewStderr = ((si.dwFlags & STARTF_USESTDHANDLES) == 0 ||
+                     GetStdHandle (STD_ERROR_HANDLE) == NULL ||
+                     ConpIsWindowsConsole (GetStdHandle (STD_ERROR_HANDLE)));
+
+    if (NeedNewStdout || NeedNewStderr) {
+        if (!ConpConnectSlaveHandle (ServerPid,
+                                     Cookie,
+                                     ( CON_HANDLE_READ_ACCESS |
+                                       CON_HANDLE_WRITE_ACCESS |
+                                       CON_HANDLE_CONNECT_ACTIVE_OUTPUT ),
+                                     &ReplacementStdout))
+        {
+            goto Out;
+        }
+
+        if (NeedNewStdout && NeedNewStderr) {
+            if (!ConpDuplicateSlaveHandle (
+                    ReplacementStdout,
+                    &ReplacementStderr,
+                    0, DUPLICATE_SAME_ACCESS, FALSE))
+            {
+                goto Out;
+            }
+        } else if (!NeedNewStdout && NeedNewStderr) {
+            ReplacementStderr = ReplacementStdout;
+            ReplacementStdout = NULL;
+        }
+    }
+
+    //
+    // Connect to the console's input queue.  Tell the server that
+    // this connection is special and that as long as it lasts, this
+    // process is attached to the given console.  If cookie refers to
+    // a console output buffer, make sure the connection actually
+    // refers only to the console input.
+    //
+
+    if (!ConpConnectSlave (ServerPid,
+                           Cookie,
+                           ( CON_HANDLE_READ_ACCESS       |
+                             CON_HANDLE_CONNECT_ATTACHED  |
+                             CON_HANDLE_CONNECT_NO_OUTPUT ),
+                           &AttachSlave))
+    {
+        goto Out;
+    }
+
+    //
+    // We've successfully attached to the console.  Commit to the new
+    // console.  There are no failure paths past this point.
+    //
+
+    ConpAttachedInput = AttachSlave;
+    AttachSlave = NULL;
+    ConpIsAnyConsoleAttached = TRUE;
+
+    Peb->ProcessParameters->WindowFlags &= ~STARTF_USEHOTKEY;
+
+    if (ReplacementStdin) {
+        ConpAttachedStdin = ReplacementStdin;
+        SetStdHandle (STD_INPUT_HANDLE, ReplacementStdin);
+        ReplacementStdin = NULL;
+    }
+
+    if (ReplacementStdout) {
+        ConpAttachedStdout = ReplacementStdout;
+        SetStdHandle (STD_OUTPUT_HANDLE, ReplacementStdout);
+        ReplacementStdout = NULL;
+    }
+
+    if (ReplacementStderr) {
+        ConpAttachedStderr = ReplacementStderr;
+        SetStdHandle (STD_ERROR_HANDLE, ReplacementStderr);
+        ReplacementStderr = NULL;
+    }
+
+    ZeroMemory (&AttachInfo, sizeof (AttachInfo));
+    AttachInfo.ServerPid = ConpAttachedInput->ServerPid;
+    AttachInfo.Cookie = ConpAttachedInput->Cookie;
+    ConpUpdateAttachInfo (AttachShared, AttachInfo);
+
+    // XXX: control-code handling --- use long polling?
+    // XXX: set thread (?) language id to match console
+
+    Result = TRUE;
+
+  Out:
+
+    if (AttachSlave) {
+        ConpDereferenceSlave (AttachSlave);
+    }
+
+    if (AttachShared) {
+        CONP_VERIFY (UnmapViewOfFile (AttachShared));
+    }
+
+    if (ReplacementStdin) {
+        CONP_VERIFY (ConpCloseSlaveHandle (ReplacementStdin));
+    }
+
+    if (ReplacementStdout) {
+        CONP_VERIFY (ConpCloseSlaveHandle (ReplacementStdout));
+    }
+
+    if (ReplacementStderr) {
+        CONP_VERIFY (ConpCloseSlaveHandle (ReplacementStderr));
+    }
+
+    return Result;
+}
+
+static
+BOOL
+ConpFreeConsole (
+    VOID
+    )
+/*++
+
+Routine Description:
+
+    This routine detaches from the current pseudo-console; it is
+    normally called by a hooked FreeConsole, which first checks
+    whether the current console is a pseudo-console.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    TRUE on success; FALSE on error with thread-error set.
+
+Environment:
+
+    Call with ConpAttachedConsoleLock held.
+
+--*/
+{
+    AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    if (ConpAttachedInput) {
+        ConpDereferenceSlave (ConpAttachedInput);
+        ConpAttachedInput = NULL;
+    }
+
+    if (ConpAttachedStdin) {
+        if (GetStdHandle (STD_INPUT_HANDLE) == ConpAttachedStdin) {
+            SetStdHandle (STD_INPUT_HANDLE, NULL);
+        }
+
+        CONP_VERIFY (ConpCloseSlaveHandle (ConpAttachedStdin));
+        ConpAttachedStdin = NULL;
+    }
+
+    if (ConpAttachedStdout) {
+        if (GetStdHandle (STD_OUTPUT_HANDLE) == ConpAttachedStdout) {
+            SetStdHandle (STD_OUTPUT_HANDLE, NULL);
+        }
+
+        CONP_VERIFY (ConpCloseSlaveHandle (ConpAttachedStdout));
+        ConpAttachedStdout = NULL;
+    }
+
+    if (ConpAttachedStderr) {
+        if (GetStdHandle (STD_ERROR_HANDLE) == ConpAttachedStderr) {
+            SetStdHandle (STD_ERROR_HANDLE, NULL);
+        }
+
+        CONP_VERIFY (ConpCloseSlaveHandle (ConpAttachedStderr));
+        ConpAttachedStderr = NULL;
+    }
+
+    ConpIsAnyConsoleAttached = FALSE;
+    ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    return TRUE;
+}
+
+static
+PCON_SHADOW_ATTRIBUTE_LIST
+ConpFindShadowAttributes (
+    LPPROC_THREAD_ATTRIBUTE_LIST AttributeList
+    )
+/*++
+
+Routine Description:
+
+    Find a shadow attribute structure given a real attribute pointer.
+
+Arguments:
+
+    AttributeList - Supplies an attribute list.
+
+Return Value:
+
+    Return the shadow attribute pointer or NULL on error.
+
+Environment:
+
+    Call with ConpShadowAttributeLock held.
+
+--*/
+{
+    PLIST_ENTRY Entry;
+    PCON_SHADOW_ATTRIBUTE_LIST ShadowAttributes;
+
+    for (Entry = ConpShadowAttributes.Flink;
+         Entry != &ConpShadowAttributes;
+         Entry = Entry->Flink)
+    {
+        ShadowAttributes = CONTAINING_RECORD (Entry,
+                                              CON_SHADOW_ATTRIBUTE_LIST,
+                                              ShadowAttributeLink);
+
+        if (ShadowAttributes->AttributeList == AttributeList) {
+            return ShadowAttributes;
+        }
+    }
+
+    return NULL;
+}
+
+BOOL CONIO_API
+ConSetChildAttach (
+    PVOID AttributeList,
+    HANDLE SlaveHandle
+    )
+{
+    BOOL Result = FALSE;
+    PCON_SHADOW_ATTRIBUTE_LIST ShadowAttributes;
+    PCON_SLAVE Slave;
+
+    Slave = ConpReferenceSlaveHandle (SlaveHandle);
+    if (Slave == NULL) {
+        goto Out;
+    }
+
+    AcquireSRWLockExclusive (&ConpShadowAttributeLock);
+    ShadowAttributes = ConpFindShadowAttributes (AttributeList);
+    if (ShadowAttributes == NULL) {
+        SetLastError (ERROR_INVALID_PARAMETER);
+        goto Out;
+    }
+
+    {
+        PCON_SLAVE Tmp = ShadowAttributes->ChildAttach;
+        ShadowAttributes->ChildAttach = Slave; // Transfer ownership
+        Slave = Tmp;
+    }
+
+    Result = TRUE;
+
+  Out:
+
+    ReleaseSRWLockExclusive (&ConpShadowAttributeLock);
+
+    if (Slave) {
+        ConpDereferenceSlave (Slave);
+    }
+
+    return Result;
+}
+
+static
+BOOL
+ConpFindShadowHandleList (
+    PCON_SHADOW_ATTRIBUTE_LIST ShadowAttributes,
+    HANDLE** HandleList,
+    SIZE_T* HandleListLength
+    )
+{
+    PLIST_ENTRY Entry;
+    PCON_SHADOW_ATTRIBUTE Attribute;
+
+    for (Entry = ShadowAttributes->Attributes.Flink;
+         Entry != &ShadowAttributes->Attributes;
+         Entry = Entry->Flink)
+    {
+        Attribute = CONTAINING_RECORD (Entry,
+                                       CON_SHADOW_ATTRIBUTE,
+                                       AttributeLink);
+
+        if (Attribute->Attribute == PROC_THREAD_ATTRIBUTE_HANDLE_LIST) {
+            *HandleList = Attribute->Value;
+            *HandleListLength = Attribute->Size / sizeof (HANDLE);
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static
+BOOL
+ConpCreateFilteredAttributeList (
+    PCON_SHADOW_ATTRIBUTE_LIST ShadowAttributes,
+    LPPROC_THREAD_ATTRIBUTE_LIST* FilteredAttributeList
+    )
+/*++
+
+Routine Description:
+
+    This routine convert a shadowed attribute list into a regular
+    attribute list.  The regular attribute list is identical to the
+    original attribute list, but with pseudo-console slave handles
+    filtered out.
+
+Arguments:
+
+    ShadowAttributes - Supplies the shadow attribute structure.
+
+    FilteredAttributeList - Receives a pointer to the new attribute
+                            list.  The caller must release this list
+                            by calling DeleteProcThreadAttributeList,
+                            then LocalFree.
+
+Return Value:
+
+    TRUE on success; FALSE on error with thread-error set.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+{
+    BOOL Result = FALSE;
+    PCON_SHADOW_ATTRIBUTE Attribute;
+    LPPROC_THREAD_ATTRIBUTE_LIST Atl;
+    PVOID Value;
+    SIZE_T Size;
+    PLIST_ENTRY Entry;
+    HANDLE* OldHandleList = NULL;
+    SIZE_T OldHandleListLength = 0; // Number of handles
+    HANDLE* NewHandleList = NULL;
+    SIZE_T NewHandleListLength = 0; // Number of handles
+    ULONG i;
+
+    (VOID) ConpFindShadowHandleList (ShadowAttributes,
+                                     &OldHandleList,
+                                     &OldHandleListLength);
+
+    Atl = LocalAlloc (LMEM_ZEROINIT,
+                      ShadowAttributes->Size +
+                      OldHandleListLength * sizeof (HANDLE));
+
+    if (!Atl) {
+        goto Out;
+    }
+
+    Size = ShadowAttributes->Size;
+    if (!InitializeProcThreadAttributeList (
+            Atl,
+            ShadowAttributes->AttributeCount,
+            ShadowAttributes->Flags,
+            &Size))
+    {
+        goto Out;
+    }
+
+    NewHandleList = (HANDLE*) ((PBYTE) Atl + Size);
+    for (i = 0; i < OldHandleListLength; ++i) {
+        if (!ConpIsSlave (OldHandleList[i])) {
+            NewHandleList[NewHandleListLength++] =
+                OldHandleList[i];
+        }
+    }
+
+    for (Entry = ShadowAttributes->Attributes.Flink;
+         Entry != &ShadowAttributes->Attributes;
+         Entry = Entry->Flink)
+    {
+        Attribute = CONTAINING_RECORD (Entry,
+                                       CON_SHADOW_ATTRIBUTE,
+                                       AttributeLink);
+        Value = Attribute->Value;
+        Size = Attribute->Size;
+
+        if (Attribute->Attribute == PROC_THREAD_ATTRIBUTE_HANDLE_LIST) {
+            CONP_ASSERT (Value == OldHandleList);
+            CONP_ASSERT (Size = OldHandleListLength * sizeof (HANDLE));
+            Value = NewHandleList;
+            Size = NewHandleListLength * sizeof (HANDLE);
+        }
+
+        if (!UpdateProcThreadAttribute (Atl,
+                                        Attribute->Flags,
+                                        Attribute->Attribute,
+                                        Value,
+                                        Size,
+                                        NULL,
+                                        NULL))
+        {
+            goto Out;
+        }
+    }
+
+    *FilteredAttributeList = Atl;
+    Atl = NULL;
+    Result = TRUE;
+
+  Out:
+
+    if (Atl) {
+        DeleteProcThreadAttributeList (Atl);
+        LocalFree (Atl);
     }
 
     return Result;
@@ -1372,7 +2546,7 @@ HOOK (CreateFileA, HANDLE,
         dwFlagsAndAttributes,
         hTemplateFile ))
 {
-    if (lpFileName && ConpAttachedConsole) {
+    if (lpFileName && ConpIsAttachedAsSlave ()) {
         PCWSTR MagicName;
 
         if (!stricmp (lpFileName, "CON")) {
@@ -1422,25 +2596,95 @@ HOOK (CreateFileW, HANDLE,
         dwFlagsAndAttributes,
         hTemplateFile ))
 {
-    if (lpFileName && ConpAttachedConsole) {
-        if (!wcsicmp (lpFileName, L"CON") ||
-            !wcsicmp (lpFileName, L"CONIN$") ||
-            !wcsicmp (lpFileName, L"CONOUT$"))
+    PCON_SLAVE LocalAttachedInput = FALSE;
+
+    //
+    // If we're trying to open a console handle, try to acquire a
+    // reference to the currently attached input queue.  If we have
+    // one, use it to establish a connection.  Otherwise, punt to
+    // normal CreateFileW.
+    //
+
+    if (lpFileName && ( !wcsicmp (lpFileName, L"CON")     ||
+                        !wcsicmp (lpFileName, L"CONIN$")  ||
+                        !wcsicmp (lpFileName, L"CONOUT$") ))
+    {
+        AcquireSRWLockShared (&ConpAttachedConsoleLock);
+        if (ConpAttachedInput) {
+            LocalAttachedInput = ConpAttachedInput;
+            InterlockedIncrement (&LocalAttachedInput->ReferenceCount);
+        }
+
+        ReleaseSRWLockShared (&ConpAttachedConsoleLock);
+    }
+
+    if (LocalAttachedInput) {
+        HANDLE Result = INVALID_HANDLE_VALUE;
+        HANDLE NewSlaveHandle;
+        ULONG Flags = 0;
+
+        // XXX: should we look for object-specific (i.e., not generic)
+        // access bits too?
+
+        if (dwDesiredAccess & GENERIC_READ) {
+            Flags |= CON_HANDLE_READ_ACCESS;
+        }
+
+        if (dwDesiredAccess & GENERIC_WRITE) {
+            Flags |= CON_HANDLE_WRITE_ACCESS;
+        }
+
+        if (lpSecurityAttributes &&
+            lpSecurityAttributes->bInheritHandle)
         {
-            HANDLE NewSlaveHandle;
-            BOOL Inherit = ( lpSecurityAttributes &&
-                             lpSecurityAttributes->bInheritHandle );
-            if (ConpDuplicateSlaveHandle (
-                    ConpAttachedConsole,
-                    &NewSlaveHandle,
-                    Inherit)
-                == FALSE)
+            Flags |= CON_HANDLE_INHERIT;
+        }
+
+        //
+        // MSDN: the meaning of "CON" depends on desired access.
+        //
+
+        if (!wcsicmp (lpFileName, L"CON")) {
+            if ( (dwDesiredAccess & GENERIC_READ) &&
+                 (dwDesiredAccess & GENERIC_WRITE))
             {
-                return INVALID_HANDLE_VALUE;
+                SetLastError (ERROR_FILE_NOT_FOUND); // Sic.
+                goto OutHooked;
             }
 
-            return NewSlaveHandle;
+            if (dwDesiredAccess & GENERIC_WRITE) {
+                lpFileName = L"CONIN$";
+            } else {
+                lpFileName = L"CONOUT$";
+            }
         }
+
+        //
+        // Note that there's a difference between connecting to an
+        // output buffer with no write access and connecting to the
+        // input queue alone.  In the former case, we keep
+        // the output buffer alive.
+        //
+
+        if (!wcsicmp (lpFileName, L"CONIN$")) {
+            Flags |= CON_HANDLE_CONNECT_NO_OUTPUT;
+        }
+
+        if (!ConpConnectSlaveHandle (
+                LocalAttachedInput->ServerPid,
+                LocalAttachedInput->Cookie,
+                Flags,
+                &NewSlaveHandle))
+        {
+            goto OutHooked;
+        }
+
+        Result = NewSlaveHandle;
+
+      OutHooked:
+
+        ConpDereferenceSlave (LocalAttachedInput);
+        return Result;
     }
 
     return CreateFileW (lpFileName,
@@ -1479,6 +2723,8 @@ HOOK (DuplicateHandle, BOOL,
         return ConpDuplicateSlaveHandle (
             hSourceHandle,
             lpTargetHandle,
+            dwDesiredAccess,
+            dwOptions,
             bInheritHandle);
     }
 
@@ -1789,7 +3035,7 @@ HOOK (AddConsoleAliasA, BOOL,
         Target,
         ExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -1805,7 +3051,7 @@ HOOK (AddConsoleAliasW, BOOL,
         Target,
         ExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -1817,14 +3063,74 @@ HOOK (AllocConsole, BOOL,
       ( VOID ),
       ( ))
 {
-    return AllocConsole ();
+    BOOL Result = FALSE;
+
+    AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    if (ConpIsAnyConsoleAttached) {
+        SetLastError (ERROR_ACCESS_DENIED);
+        goto Out;
+    }
+
+    Result = AllocConsole ();
+    if (Result) {
+        ConpIsAnyConsoleAttached = TRUE;
+    }
+
+  Out:
+
+    ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+    return Result;
 }
 
 HOOK (AttachConsole, BOOL,
       ( DWORD ProcessId ),
       ( ProcessId ))
 {
-    return AttachConsole (ProcessId);
+    CON_ATTACH_INFO AttachInfo;
+    BOOL Result = FALSE;
+
+    AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    if (ConpIsAnyConsoleAttached) {
+        SetLastError (ERROR_ACCESS_DENIED);
+        goto Out;
+    }
+
+    // XXX: support attaching to parent process
+
+    //
+    // Consult the shared section to see whether the given process is
+    // attached to a pseudoconsole.  If the process has pseudoconsole
+    // information and we can't read it, fail the operation.
+    //
+
+    if (!ConpReadAttachInfo (ProcessId, &AttachInfo)) {
+        goto Out;
+    }
+
+    //
+    // If the process to which we're trying to attach isn't attached
+    // to a pseudoconsole, punt to the regular console library.
+    // Otherwise, try to attach to the pseudo-console.  If either
+    // succeeds, we're now attached to a console.
+    //
+
+    if (AttachInfo.ServerPid != 0) {
+        Result = ConpAttachConsole (AttachInfo.ServerPid,
+                                    AttachInfo.Cookie);
+    } else {
+        Result = AttachConsole (ProcessId);
+    }
+
+    if (Result) {
+        ConpIsAnyConsoleAttached = TRUE;
+    }
+
+  Out:
+
+    ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+    return Result;
 }
 
 HOOK (CreateConsoleScreenBuffer, HANDLE,
@@ -1839,7 +3145,7 @@ HOOK (CreateConsoleScreenBuffer, HANDLE,
         dwFlags,
         lpScreenBufferData ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -1942,12 +3248,24 @@ HOOK (FreeConsole, BOOL,
       ( VOID ),
       ( ))
 {
-    if (ConpAttachedConsole) {
-        SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
-        return FALSE;
+    BOOL Result;
+
+    AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+
+    if (ConpAttachedInput) {
+        Result = ConpFreeConsole ();
+    } else {
+        Result = FreeConsole ();
     }
 
-    return FreeConsole ();
+    if (Result) {
+        ConpIsAnyConsoleAttached = FALSE;
+    }
+
+  Out:
+
+    ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+    return Result;
 }
 
 HOOK (GenerateConsoleCtrlEvent, BOOL,
@@ -1956,7 +3274,7 @@ HOOK (GenerateConsoleCtrlEvent, BOOL,
       ( dwCtrlEvent,
         dwProcessGroupId ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -1974,7 +3292,7 @@ HOOK (GetConsoleAliasA, DWORD,
         TargetBufferLength,
         lpExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -1996,7 +3314,7 @@ HOOK (GetConsoleAliasW, DWORD,
         TargetBufferLength,
         lpExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2015,7 +3333,7 @@ HOOK (GetConsoleAliasesA, DWORD,
         AliasBufferLength,
         lpExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2034,7 +3352,7 @@ HOOK (GetConsoleAliasesW, DWORD,
         AliasBufferLength,
         lpExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2049,7 +3367,7 @@ HOOK (GetConsoleAliasesLengthA, DWORD,
       ( LPSTR lpExeName ),
       ( lpExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2061,7 +3379,7 @@ HOOK (GetConsoleAliasesLengthW, DWORD,
       ( LPWSTR lpExeName ),
       ( lpExeName ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2075,7 +3393,7 @@ HOOK (GetConsoleAliasExesA, DWORD,
       ( lpExeNameBuffer,
         ExeNameBufferLength ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2091,7 +3409,7 @@ HOOK (GetConsoleAliasExesW, DWORD,
       ( lpExeNameBuffer,
         ExeNameBufferLength ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2105,7 +3423,7 @@ HOOK (GetConsoleAliasExesLengthA, DWORD,
       ( VOID ),
       ( ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2117,7 +3435,7 @@ HOOK (GetConsoleAliasExesLengthW, DWORD,
       ( VOID ),
       ( ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2129,7 +3447,7 @@ HOOK (GetConsoleCP, UINT,
       ( VOID ),
       ( ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2152,7 +3470,7 @@ HOOK (GetConsoleDisplayMode, BOOL,
       ( LPDWORD lpModeFlags ),
       ( lpModeFlags ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2182,7 +3500,7 @@ HOOK (GetConsoleHistoryInfo, BOOL,
       ( PCONSOLE_HISTORY_INFO lpConsoleHistoryInfo ),
       ( lpConsoleHistoryInfo ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2210,7 +3528,7 @@ HOOK (GetConsoleOriginalTitleA, DWORD,
       ( lpConsoleTitleA,
         nSize ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2224,7 +3542,7 @@ HOOK (GetConsoleOriginalTitleW, DWORD,
       ( lpConsoleTitle,
         nSize ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2236,7 +3554,7 @@ HOOK (GetConsoleOutputCP, UINT,
       ( VOID ),
       ( ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2250,7 +3568,7 @@ HOOK (GetConsoleProcessList, DWORD,
       ( lpdwProcessList,
         dwProcessCount ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2294,7 +3612,7 @@ HOOK (GetConsoleSelectionInfo, BOOL,
       ( PCONSOLE_SELECTION_INFO lpConsoleSelectionInfo ),
       ( lpConsoleSelectionInfo ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2308,7 +3626,7 @@ HOOK (GetConsoleTitleA, DWORD,
       ( lpConsoleTitle,
         nSize ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2322,7 +3640,7 @@ HOOK (GetConsoleTitleW, DWORD,
       ( lpConsoleTitle,
         nSize ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2334,7 +3652,7 @@ HOOK (GetConsoleWindow, HWND,
       ( VOID ),
       ( ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return NULL;
     }
@@ -2385,7 +3703,7 @@ HOOK (GetLargestConsoleWindowSize, COORD,
     ( HANDLE hConsoleOutput ),
     ( hConsoleOutput ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         COORD Zero;
 
         ZeroMemory (&Zero, sizeof (Zero));
@@ -2417,7 +3735,7 @@ HOOK (GetNumberOfConsoleMouseButtons, BOOL,
       ( LPDWORD lpNumberOfMouseButtons ),
       ( lpNumberOfMouseButtons ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2755,7 +4073,7 @@ HOOK (SetConsoleCP, BOOL,
       ( UINT wCodePageID ),
       ( wCodePageID ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2828,7 +4146,7 @@ HOOK (SetConsoleHistoryInfo, BOOL,
       ( PCONSOLE_HISTORY_INFO lpConsoleHistoryInfo ),
       ( lpConsoleHistoryInfo ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2857,7 +4175,7 @@ HOOK (SetConsoleOutputCP, BOOL,
       ( UINT wCodePageID ),
       ( wCodePageID ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2918,7 +4236,7 @@ HOOK (SetConsoleTitleA, BOOL,
       ( LPCSTR lpConsoleTitle ),
       ( lpConsoleTitle ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -2930,7 +4248,7 @@ HOOK (SetConsoleTitleW, BOOL,
       ( LPCWSTR lpConsoleTitle ),
       ( lpConsoleTitle ))
 {
-    if (ConpAttachedConsole) {
+    if (ConpIsAttachedAsSlave ()) {
         SetLastError (ERROR_CALL_NOT_IMPLEMENTED);
         return FALSE;
     }
@@ -3219,6 +4537,98 @@ HOOK (CreateProcessW, BOOL,
         lpStartupInfo,
         lpProcessInformation))
 {
+    BOOL Result = FALSE;
+    STARTUPINFOEXW* Si = NULL;
+    ULONG SiSize;
+    PCON_SHADOW_ATTRIBUTE_LIST Sal;
+    LPPROC_THREAD_ATTRIBUTE_LIST Ptal = NULL;
+
+    PCON_SLAVE ChildAttach = NULL;
+
+    HANDLE* HandleList;
+    SIZE_T HandleListLength;
+    BOOL HandleListPresent = FALSE;
+
+    //
+    // Copy the startupinfo so we can modify it.
+    //
+
+    SiSize = lpStartupInfo->cb;
+    if (SiSize == 0) {
+        SiSize = sizeof (*lpStartupInfo);
+    }
+
+    Si = LocalAlloc (0, SiSize);
+    memcpy (Si, lpStartupInfo, SiSize);
+
+    //
+    // If the user gave us extended attributes, substitute a version
+    // with all the console pseudo-handles stripped out; if the user
+    // set an attach console for the child, use it; and if the
+    // attribute list contains a handle list, make sure to constrain
+    // the inherited handles to ones on the list.
+    //
+
+    if (dwCreationFlags & EXTENDED_STARTUPINFO_PRESENT &&
+        sizeof (*Si) <= Si->StartupInfo.cb &&
+        Si->lpAttributeList)
+    {
+        AcquireSRWLockExclusive (&ConpShadowAttributeLock);
+        Sal = ConpFindShadowAttributes (Si->lpAttributeList);
+        if (Sal) {
+            if (!ConpCreateFilteredAttributeList (Sal, &Ptal)) {
+                goto Out;
+            }
+
+            ConpTrace (L"Sal->ChildAttach %p", Sal->ChildAttach);
+
+            if (Sal->ChildAttach) {
+                ChildAttach = Sal->ChildAttach;
+                InterlockedIncrement (&ChildAttach->ReferenceCount);
+            }
+
+            Si->lpAttributeList = Ptal;
+
+            HandleListPresent =
+                ConpFindShadowHandleList (Sal,
+                                          &HandleList,
+                                          &HandleListLength);
+        }
+
+        ReleaseSRWLockExclusive (&ConpShadowAttributeLock);
+    }
+
+    //
+    // If our caller didn't tell us the console to which the child
+    // should be attached, try to figure it out based on process
+    // context and flags.
+    //
+
+    if (ChildAttach == NULL &&
+        (dwCreationFlags & CREATE_NEW_CONSOLE) == 0 &&
+        (dwCreationFlags & DETACHED_PROCESS) == 0)
+    {
+        AcquireSRWLockExclusive (&ConpAttachedConsoleLock);
+        if (ConpAttachedInput) {
+            ChildAttach = ConpAttachedInput;
+            InterlockedIncrement (&ChildAttach->ReferenceCount);
+        }
+
+        ReleaseSRWLockExclusive (&ConpAttachedConsoleLock);
+    }
+
+    //
+    // If the top-level enable switch for handle inheritance isn't
+    // given, stop inheritance by pretending we have a zero-length
+    // handle list.
+    //
+
+    if (bInheritHandles == FALSE) {
+        HandleListPresent = TRUE;
+        HandleList = NULL;
+        HandleListLength = 0;
+    }
+
     if (CreateProcessW (lpApplicationName,
                         lpCommandLine,
                         lpProcessAttributes,
@@ -3227,14 +4637,24 @@ HOOK (CreateProcessW, BOOL,
                         dwCreationFlags | CREATE_SUSPENDED,
                         lpEnvironment,
                         lpCurrentDirectory,
-                        lpStartupInfo,
+                        &Si->StartupInfo,
                         lpProcessInformation)
         == FALSE)
     {
-        return FALSE;
+        goto Out;
     }
 
-    if (!ConpPropagateInheritance (lpProcessInformation->hProcess)) {
+    //
+    // Tell the child about any handles it's inheriting.
+    //
+
+    if (!ConpPropagateInheritance (
+            lpProcessInformation->hProcess,
+            ChildAttach,
+            HandleListPresent,
+            HandleList,
+            HandleListLength))
+    {
         ULONG SavedError = GetLastError ();
         (VOID) TerminateProcess (lpProcessInformation->hProcess,
                                  HRESULT_FROM_WIN32 (SavedError));
@@ -3243,14 +4663,28 @@ HOOK (CreateProcessW, BOOL,
         CONP_VERIFY (CloseHandle (lpProcessInformation->hProcess));
         ZeroMemory (lpProcessInformation, sizeof (*lpProcessInformation));
         SetLastError (SavedError);
-        return FALSE;
+        goto Out;
     }
 
     if ((dwCreationFlags & CREATE_SUSPENDED) == 0) {
         (VOID) ResumeThread (lpProcessInformation->hThread);
     }
 
-    return TRUE;
+    Result = TRUE;
+
+  Out:
+
+    if (Ptal) {
+        DeleteProcThreadAttributeList (Ptal);
+        LocalFree (Ptal);
+    }
+
+    if (ChildAttach) {
+        ConpDereferenceSlave (ChildAttach);
+    }
+
+    LocalFree (Si);
+    return Result;
 }
 
 HOOK (GetHandleInformation, BOOL,
@@ -3267,7 +4701,9 @@ HOOK (GetHandleInformation, BOOL,
             return FALSE;
         }
 
-        *lpdwFlags = Slave->HandleFlags;
+        *lpdwFlags = Slave->Flags & (HANDLE_FLAG_INHERIT |
+                                     HANDLE_FLAG_PROTECT_FROM_CLOSE);
+
         ConpDereferenceSlave (Slave);
         return TRUE;
     }
@@ -3285,21 +4721,173 @@ HOOK (SetHandleInformation, BOOL,
 {
     if (ConpIsSlave (hObject)) {
         PCON_SLAVE Slave;
-        ULONG Flags;
+        ULONG OldFlags;
+        ULONG NewFlags;
 
         Slave = ConpReferenceSlaveHandle (hObject);
         if (Slave == NULL) {
             return FALSE;
         }
 
-        Flags = Slave->HandleFlags;
-        Flags = (Flags &~ dwMask) | dwFlags;
-        Slave->HandleFlags = Flags;
+        dwMask &= (HANDLE_FLAG_INHERIT |
+                   HANDLE_FLAG_PROTECT_FROM_CLOSE);
+
+        do {
+            OldFlags = Slave->Flags;
+            NewFlags = (OldFlags &~ dwMask) | dwFlags;
+        } while (InterlockedCompareExchange ((LONG*) &Slave->Flags,
+                                             NewFlags,
+                                             OldFlags)
+                 != (LONG) OldFlags);
+
         ConpDereferenceSlave (Slave);
         return TRUE;
     }
 
     return SetHandleInformation (hObject, dwMask, dwFlags);
+}
+
+HOOK (InitializeProcThreadAttributeList, BOOL,
+      ( LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+        DWORD dwAttributeCount,
+        DWORD dwFlags,
+        PSIZE_T lpSize ),
+      ( lpAttributeList,
+        dwAttributeCount,
+        dwFlags,
+        lpSize ))
+{
+    PCON_SHADOW_ATTRIBUTE_LIST ShadowAttributes;
+
+    if (!InitializeProcThreadAttributeList(lpAttributeList,
+                                           dwAttributeCount,
+                                           dwFlags,
+                                           lpSize))
+    {
+        return FALSE;
+    }
+
+    ShadowAttributes = LocalAlloc (LMEM_ZEROINIT,
+                                   sizeof (*ShadowAttributes));
+
+    if (ShadowAttributes == NULL) {
+        DeleteProcThreadAttributeList (lpAttributeList);
+        return FALSE;
+    }
+
+    ShadowAttributes->AttributeList = lpAttributeList;
+    ShadowAttributes->AttributeCount = dwAttributeCount;
+    ShadowAttributes->Flags = dwFlags;
+    ShadowAttributes->Size = *lpSize;
+    InitializeListHead (&ShadowAttributes->Attributes);
+
+    AcquireSRWLockExclusive (&ConpShadowAttributeLock);
+    InsertHeadList (&ConpShadowAttributes,
+                    &ShadowAttributes->ShadowAttributeLink);
+
+    ReleaseSRWLockExclusive (&ConpShadowAttributeLock);
+
+    return TRUE;
+}
+
+HOOK (UpdateProcThreadAttribute, BOOL,
+      ( LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+        DWORD dwFlags,
+        DWORD_PTR Attribute,
+        PVOID lpValue,
+        SIZE_T cbSize,
+        PVOID lpPreviousValue,
+        PSIZE_T lpReturnSize ),
+      ( lpAttributeList,
+        dwFlags,
+        Attribute,
+        lpValue,
+        cbSize,
+        lpPreviousValue,
+        lpReturnSize ))
+{
+    BOOL Result = FALSE;
+    PCON_SHADOW_ATTRIBUTE_LIST ShadowAttributes = NULL;
+    PCON_SHADOW_ATTRIBUTE ShadowAttribute = NULL;
+
+    AcquireSRWLockExclusive (&ConpShadowAttributeLock);
+    ShadowAttributes = ConpFindShadowAttributes (lpAttributeList);
+
+    if (ShadowAttributes) {
+        ShadowAttribute = LocalAlloc (LMEM_ZEROINIT,
+                                      sizeof (*ShadowAttribute));
+
+        if (!ShadowAttribute) {
+            goto Out;
+        }
+
+        ShadowAttribute->Flags = dwFlags;
+        ShadowAttribute->Attribute = Attribute;
+        ShadowAttribute->Value = lpValue;
+        ShadowAttribute->Size = cbSize;
+        InsertTailList (&ShadowAttributes->Attributes,
+                        &ShadowAttribute->AttributeLink);
+    }
+
+    if (!UpdateProcThreadAttribute(
+            lpAttributeList,
+            dwFlags,
+            Attribute,
+            lpValue,
+            cbSize,
+            lpPreviousValue,
+            lpReturnSize))
+    {
+        goto Out;
+    }
+
+    ShadowAttribute = NULL;
+    Result = TRUE;
+
+  Out:
+
+    if (ShadowAttribute) {
+        RemoveEntryList (&ShadowAttribute->AttributeLink);
+        LocalFree (ShadowAttribute);
+    }
+
+    ReleaseSRWLockExclusive (&ConpShadowAttributeLock);
+    return Result;
+}
+
+HOOK (DeleteProcThreadAttributeList, ULONG,
+      ( LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList ),
+      ( lpAttributeList ))
+{
+    PLIST_ENTRY Entry;
+    PCON_SHADOW_ATTRIBUTE_LIST ShadowAttributes;
+    PCON_SHADOW_ATTRIBUTE Attribute;
+
+    AcquireSRWLockExclusive (&ConpShadowAttributeLock);
+    ShadowAttributes = ConpFindShadowAttributes (lpAttributeList);
+    if (ShadowAttributes) {
+        for (Entry = RemoveHeadList (&ShadowAttributes->Attributes);
+             Entry != &ShadowAttributes->Attributes;
+             Entry = RemoveHeadList (&ShadowAttributes->Attributes))
+        {
+            Attribute = CONTAINING_RECORD (Entry,
+                                           CON_SHADOW_ATTRIBUTE,
+                                           AttributeLink);
+
+            LocalFree (Attribute);
+        }
+
+        if (ShadowAttributes->ChildAttach) {
+            ConpDereferenceSlave (ShadowAttributes->ChildAttach);
+        }
+
+        LocalFree (ShadowAttributes);
+    }
+
+    ReleaseSRWLockExclusive (&ConpShadowAttributeLock);
+
+    DeleteProcThreadAttributeList (lpAttributeList);
+    return 0; // Ignored
 }
 
 BOOL
@@ -3395,6 +4983,7 @@ ConpTrace (
         fflush (stderr);
         va_end (Args);
     }
+
     ReleaseSRWLockExclusive (&TraceLock);
     SetLastError (SavedError);
 }

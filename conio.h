@@ -401,3 +401,35 @@ VOID CONIO_API
 ConDefaultHandleRequest (
     PCON_REQUEST Request
     );
+
+/*++
+
+Routine Description:
+
+    ConSetChildAttach allows a process to create a child process that
+    will attach itself to the given pseudo-console.  Call
+    ConSetChildAttach on a PROC_THREAD_ATTRIBUTE_LIST before creating
+    the child process.
+
+Arguments:
+
+    AttributeList - Supplies the attribute list to manipulate.
+
+    Handle - Supplies a slave handle to the console to which the child
+             will attach.  For the purposes of ConSetChildAttach, all
+             slave handles for a given console are equivalent.
+
+Return Value:
+
+    BOOL - TRUE on success; FALSE on error with thread-error set.
+
+Environment:
+
+    Arbitrary.
+
+--*/
+BOOL CONIO_API
+ConSetChildAttach (
+    PVOID AttributeList,
+    HANDLE SlaveHandle
+    );

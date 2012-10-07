@@ -14,7 +14,6 @@
 #include <winternl.h>
 #endif
 
-
 typedef struct _XPROCESS_BASIC_INFORMATION {
     PVOID Reserved1;
     PPEB PebBaseAddress;
@@ -29,8 +28,50 @@ typedef struct _XPEB_LDR_DATA {
   LIST_ENTRY InMemoryOrderModuleList;
 } XPEB_LDR_DATA, *PXPEB_LDR_DATA;
 
-typedef struct _XRTL_USER_PROCESS_PARAMATERS \
-XRTL_USER_PROCESS_PARAMATERS, *PXRTL_USER_PROCESS_PARAMETERS;
+typedef struct _XRTL_USER_PROCESS_PARAMETERS \
+XRTL_USER_PROCESS_PARAMETERS, *PXRTL_USER_PROCESS_PARAMETERS;
+
+//
+// From undocumented.ntinternals.net.
+//
+
+struct _XRTL_USER_PROCESS_PARAMETERS {
+    ULONG                   MaximumLength;
+    ULONG                   Length;
+    ULONG                   Flags;
+    ULONG                   DebugFlags;
+    PVOID                   ConsoleHandle;
+    ULONG                   ConsoleFlags;
+    HANDLE                  StdInputHandle;
+    HANDLE                  StdOutputHandle;
+    HANDLE                  StdErrorHandle;
+    UNICODE_STRING          CurrentDirectoryPath;
+    HANDLE                  CurrentDirectoryHandle;
+    UNICODE_STRING          DllPath;
+    UNICODE_STRING          ImagePathName;
+    UNICODE_STRING          CommandLine;
+    PVOID                   Environment;
+    ULONG                   StartingPositionLeft;
+    ULONG                   StartingPositionTop;
+    ULONG                   Width;
+    ULONG                   Height;
+    ULONG                   CharWidth;
+    ULONG                   CharHeight;
+    ULONG                   ConsoleTextAttributes;
+    ULONG                   WindowFlags;
+    ULONG                   ShowWindowFlags;
+    UNICODE_STRING          WindowTitle;
+    UNICODE_STRING          DesktopName;
+    UNICODE_STRING          ShellInfo;
+    UNICODE_STRING          RuntimeData;
+#if 0
+    RTL_DRIVE_LETTER_CURDIR DLCurrentDirectory[0x20];
+#endif
+};
+
+//
+// From undocumented.ntinternals.net.
+//
 
 typedef struct _XPEB {
     BOOLEAN                 InheritedAddressSpace;
@@ -123,3 +164,45 @@ NtCreateDirectoryObject(
   /*IN*/ POBJECT_ATTRIBUTES  ObjectAttributes);
 
 #endif /* DIRECTORY_ALL_ACCESS */
+
+#ifdef __CYGWIN__
+typedef PVOID LPPROC_THREAD_ATTRIBUTE_LIST;
+#endif
+
+__declspec(dllimport)
+BOOL WINAPI InitializeProcThreadAttributeList (
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+    DWORD dwAttributeCount,
+    DWORD dwFlags,
+    PSIZE_T lpSize
+    );
+
+__declspec(dllimport)
+VOID WINAPI DeleteProcThreadAttributeList (
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList
+);
+
+__declspec(dllimport)
+BOOL WINAPI UpdateProcThreadAttribute (
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+    DWORD dwFlags,
+    DWORD_PTR Attribute,
+    PVOID lpValue,
+    SIZE_T cbSize,
+    PVOID lpPreviousValue,
+    PSIZE_T lpReturnSize
+    );
+
+#ifndef PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+#define PROC_THREAD_ATTRIBUTE_PARENT_PROCESS 0x00020000
+#define PROC_THREAD_ATTRIBUTE_HANDLE_LIST 0x00020002
+#endif
+
+#ifndef EXTENDED_STARTUPINFO_PRESENT
+#define EXTENDED_STARTUPINFO_PRESENT	0x00080000
+#endif
+
+typedef struct _XSTARTUPINFOEX {
+    STARTUPINFOW StartupInfo;
+    LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList;
+} XSTARTUPINFOEX, *PXSTARTUPINFOEX;

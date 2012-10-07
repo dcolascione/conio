@@ -109,6 +109,12 @@ struct _CON_CONNECTION {
     HANDLE Pipe;
 
     //
+    // Flags the client sent us for this connection.
+    //
+
+    ULONG Flags;
+
+    //
     // Strong reference to master.
     //
 
@@ -478,6 +484,18 @@ Environment:
         goto Out;                                                       \
     }
 
+#define CHECK_FLAG(NeededFlags)                                         \
+    if ((Connection->Flags & NeededFlags) != NeededFlags) {             \
+        if (!ConpStartWritingErrorReply (Connection,                    \
+                                         ERROR_ACCESS_DENIED))          \
+        {                                                               \
+            goto Out;                                                   \
+        }                                                               \
+                                                                        \
+        Result = TRUE;                                                  \
+        goto Out;                                                       \
+    }
+
 #define MAYBE_SEND_ERROR_REPLY()                                        \
     if (Request.Success == FALSE) {                                     \
         if (!ConpStartWritingErrorReply (Connection, Request.Error)) {  \
@@ -505,10 +523,13 @@ Environment:
     if (!ConpStartWriting (Connection, Reply, Reply->Size)) {   \
         goto Out;                                               \
     }                                                           \
-                                                                \
-    Connection->State = ConConnectionSendingReply;
 
+    Connection->State = ConConnectionSendingReply;
     CHECK_MSG_SIZE (Type);
+
+    ConpTrace (
+        L"SERVER: recv size:%lu type:%lu",
+        Message->Size, Message->Type);
 
     //
     // Parse the message and call the appropriate handler.
@@ -517,6 +538,7 @@ Environment:
     switch (Message->Type) {
         case ConMsgReadFile: {
             CHECK_MSG_SIZE (ReadFile);
+            CHECK_FLAG (CON_HANDLE_READ_ACCESS);
 
             //
             // Call the handler and ask it to service the client's
@@ -553,6 +575,7 @@ Environment:
 
         case ConMsgWriteFile: {
             CHECK_MSG_SIZE (WriteFile);
+            CHECK_FLAG (CON_HANDLE_WRITE_ACCESS);
 
             ConpPrepareRequest (Connection, &Request);
             Request.Type = ConWriteFile;
@@ -571,8 +594,53 @@ Environment:
             break;
         }
 
+        case ConMsgInitializeConnection: {
+            CHECK_MSG_SIZE (InitializeConnection);
+
+            ConpTrace (L"SERVER: ConMsgInitializeConnection flags:0x%lx",
+                       Message->InitializeConnection.Flags);
+            
+            Connection->Flags = Message->InitializeConnection.Flags;
+
+            if (Connection->Output &&
+                (Connection->Flags & (CON_HANDLE_CONNECT_NO_OUTPUT |
+                                      CON_HANDLE_CONNECT_ACTIVE_OUTPUT)))
+            {
+                ConpDereferenceOutput (Connection->Output);
+                Connection->Output = NULL;
+            }
+
+            if (Connection->Flags & CON_HANDLE_CONNECT_ACTIVE_OUTPUT) {
+                CONP_ASSERT (Connection->Output == NULL);
+
+                AcquireSRWLockExclusive (&Connection->Master->Lock);
+                if (Connection->Master->ActiveOutput == NULL) {
+                    ReleaseSRWLockExclusive (&Connection->Master->Lock);
+                    goto Out; // Only happens on master shutdown
+                }
+
+                Connection->Output = Connection->Master->ActiveOutput;
+                Connection->Output->ReferenceCount += 1;
+                ReleaseSRWLockExclusive (&Connection->Master->Lock);
+            }
+
+            ALLOCATE_REPLY (ConReplyInitializeConnection,
+                            InitializeConnectionReply,
+                            0);
+
+            Reply->InitializeConnectionReply.NewCookie =
+                ( Connection->Output
+                  ? Connection->Output->Cookie
+                  : Connection->Master->Cookie );
+
+            SEND_REPLY ();
+            break;
+        }
+
         default: {
-            ConpTrace (L"Received unknown message type %u", Message->Type);
+            ConpTrace (L"SERVER: Received unknown message type %u",
+                       Message->Type);
+
             goto Out;
         }
     }
@@ -601,25 +669,25 @@ ConpOnReplySent (
     PCON_CONNECTION Connection
     )
 /*++
-    
+
 Routine Description:
-    
+
     ConpOnIoCompletion calls this routine when we finish sending the
     response to a request.  This routine starts listening for another
     request.
-    
+
 Arguments:
-    
+
     Connection - Supplies the connection.
-    
+
 Return Value:
-    
+
     None.
-    
+
 Environment:
-    
+
     Threadpool callback.
-    
+
 --*/
 {
     BOOL Result = FALSE;
@@ -806,10 +874,12 @@ Environment:
     {
         CONP_ASSERT (Connection->ReferenceCount > 0);
 
+#if 0
         ConpTrace (L"IO complete: CONN:%p RC:%ld RESULT: 0x%lx",
                    Connection,
                    Connection->ReferenceCount,
                    IoResult);
+#endif
 
         IsShuttingDown = Master->ShuttingDown;
     }
@@ -1003,7 +1073,9 @@ Environment:
     InsertTailList (&Master->Connections,
                     &Connection->ConnectionsLink);
 
+#if 0
     ConpTrace (L"New object: PN:%s CONN:%p", PipeName, Connection);
+#endif
 
     *NumberCreatedPipes += 1;
     *NewConnection = Connection;
@@ -1179,7 +1251,7 @@ ConCreatePseudoConsole (
     }
 
     Master->ActiveOutput = FirstOutput;
-    FirstOutput->ReferenceCount += 1;
+    Master->ActiveOutput->ReferenceCount += 1;
 
     //
     // Now set up the initial connection listeners.
@@ -1347,7 +1419,8 @@ ConMakeSlaveHandle (
     (VOID) ConpConnectSlaveHandle (
         GetCurrentProcessId (),
         ActiveOutput->Cookie,
-        0 /*HandleFlags */,
+        ( CON_HANDLE_READ_ACCESS |
+          CON_HANDLE_WRITE_ACCESS ),
         &SlaveHandle);
 
     ConpDereferenceOutput (ActiveOutput);

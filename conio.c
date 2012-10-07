@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include "conio.h"
+#include "xdefs.h"
 
 VOID WINAPI
 pty_ConHandleRequest (
@@ -83,6 +84,11 @@ main (int argc, char** argv)
       return 1;
     }
 
+#if 1
+
+#endif
+
+#if 0
   if (!DuplicateHandle (GetCurrentProcess (),
                         slave,
                         GetCurrentProcess (),
@@ -94,6 +100,7 @@ main (int argc, char** argv)
       fprintf (stderr, "DuplicateHandle 0x%lx\n", GetLastError ());
       return 1;
     }
+#endif
 
 #if 0
   {
@@ -113,7 +120,9 @@ main (int argc, char** argv)
     char buffer[1024] = "Hello, server!";
     ULONG bytes_written;
 
-    if (!WriteFile (slave, buffer, strlen (buffer) + 1, &bytes_written, NULL)) {
+    if (!WriteFile (slave, buffer, strlen (buffer) + 1,
+                    &bytes_written, NULL))
+    {
       fprintf (stderr, "WriteFile FAILED: 0x%lx\n", GetLastError ());
       return 1;
     }
@@ -122,36 +131,60 @@ main (int argc, char** argv)
   }
 #endif
 
+#if 1
   {
-    STARTUPINFO si;
     PROCESS_INFORMATION pi;
     PWSTR cmdline = wcsdup (GetCommandLine ());
+    ULONG exitcode;
+    XSTARTUPINFOEX six;
+    LPPROC_THREAD_ATTRIBUTE_LIST atl = NULL;
+    SIZE_T atl_size = 0;
 
-    ZeroMemory (&si, sizeof (si));
+    ZeroMemory (&six, sizeof (six));
+    six.StartupInfo.cb = sizeof (six);
+
+    InitializeProcThreadAttributeList (NULL, 1, 0, &atl_size);
+    atl = malloc (atl_size);
+    if (!InitializeProcThreadAttributeList (atl, 1, 0, &atl_size)) {
+        fprintf (stderr, "InitializeProcThreadAttributeList 0x%lx\n",
+                 GetLastError ());
+        return 1;
+    }
+
+    if (!ConSetChildAttach (atl, slave)) {
+        fprintf (stderr, "ConSetChildAttach 0x%lx\n", GetLastError ());
+        return 1;
+    }
+
+    six.lpAttributeList = atl;
 
     while (*cmdline && !isspace (*cmdline)) ++cmdline;
     while (*cmdline && isspace (*cmdline)) ++cmdline;
-
-    fprintf (stderr, "wtf [%S]\n", cmdline);
 
     if (!CreateProcess (NULL,
                         cmdline,
                         NULL, NULL,
                         TRUE,
-                        0 /* CreationFlags */,
+                        EXTENDED_STARTUPINFO_PRESENT,
                         NULL /* Environment */,
                         NULL /* CurrentDirectory */,
-                        &si,
+                        &six.StartupInfo,
                         &pi))
       {
         fprintf (stderr, "CreateProcess: 0x%lx\n", GetLastError ());
         return 1;
       }
 
-    Sleep (10000);
+    Sleep (1000);
 
     WaitForSingleObject (pi.hProcess, INFINITE);
+    GetExitCodeProcess (pi.hProcess, &exitcode);
+
+    fprintf (stderr, "Child exit: 0x%lx\n", exitcode);
+    CloseHandle (pi.hProcess);
+    CloseHandle (pi.hThread);
   }
+#endif
 
   
 }
