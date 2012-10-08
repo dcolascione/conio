@@ -132,7 +132,7 @@ typedef struct _CON_MESSAGE {
             ULONG NumberBytesWritten;
         } WriteFileReply;
     };
-    
+
 } CON_MESSAGE, *PCON_MESSAGE;
 
 #define CON_MESSAGE_SIZE(Field) \

@@ -599,7 +599,7 @@ Environment:
 
             ConpTrace (L"SERVER: ConMsgInitializeConnection flags:0x%lx",
                        Message->InitializeConnection.Flags);
-            
+
             Connection->Flags = Message->InitializeConnection.Flags;
 
             if (Connection->Output &&

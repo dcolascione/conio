@@ -124,7 +124,7 @@ typedef struct _CON_SHADOW_ATTRIBUTE_LIST {
     SIZE_T Size;
     PCON_SLAVE ChildAttach;
     LIST_ENTRY Attributes;
-    HANDLE* ParentProcess; // XXX
+    HANDLE* ParentProcess; // XXX Support inheriting from non-parent? How?
 } CON_SHADOW_ATTRIBUTE_LIST, *PCON_SHADOW_ATTRIBUTE_LIST;
 
 //
@@ -1347,6 +1347,8 @@ Environment:
     }
 
     ConpTrace (L"Found inheritance section!");
+    extern VOID WINAPI DbgBreakPoint (VOID);
+    DbgBreakPoint ();
 
     ConStartupInfo = MapViewOfFile (Section, FILE_MAP_READ, 0, 0, 0);
     if (ConStartupInfo == NULL) {
@@ -1622,11 +1624,6 @@ Environment:
     }
 
     ConpTrace (L"INHERIT: nr:%u hlp:%lu", j, HandleListPresent);
-    ConpTrace (L"PID is %lu sleeping for 10s...",
-               GetProcessId (FrozenChild));
-
-    Sleep (10000);
-
     StartupInfoSize = (sizeof (*ConStartupInfo) +
                        j * sizeof (ConStartupInfo->Handle[0]));
 
@@ -5056,6 +5053,7 @@ ConpTrace (
     NeededLength += _vscwprintf (Format, Args);
     va_end (Args);
 
+    NeededLength += 1; // Newline
     NeededLength += 1; // Terminating nul
 
     Buffer = LocalAlloc (0, sizeof (WCHAR) * (NeededLength));
@@ -5066,13 +5064,12 @@ ConpTrace (
     FormatLength = 0;
     FormatLength += swprintf (Buffer + FormatLength, PREFIX);
     FormatLength += _vswprintf (Buffer + FormatLength, Format, Args);
+    Buffer[FormatLength++] = L'\n';
+    Buffer[FormatLength] = L'\0';
     OutputDebugString (Buffer);
 
-    AnsiBuffer = LocalAlloc (0, 2 * (FormatLength + 2));
-    AnsiLength = wcstombs (AnsiBuffer, Buffer, 2 * (FormatLength + 2));
-    AnsiBuffer[AnsiLength++] = '\n';
-    AnsiBuffer[AnsiLength] = '\0';
-
+    AnsiBuffer = LocalAlloc (0, 2 * (FormatLength + 1));
+    AnsiLength = wcstombs (AnsiBuffer, Buffer, 2 * (FormatLength + 1));
     AcquireSRWLockExclusive (&LogLock);
     LogLockHeld = TRUE;
 

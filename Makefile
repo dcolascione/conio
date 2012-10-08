@@ -62,5 +62,3 @@ conio: conio.c conio-32.dll conio-64.dll
 clean:
 	rm -f ./*.exe ./*.dll ./*.o ./*.o64 ./*.o32 ./*.i \
 		./*-generated.c ./*.stackdump
-
-

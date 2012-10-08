@@ -15,7 +15,7 @@ pty_ConHandleRequest (
     )
 {
   static char msg[22] = "Hello, world!";
-  
+
   fprintf (stderr, "CONIO: Request type: %u\n", Request->Type);
 
   switch (Request->Type)
@@ -184,5 +184,5 @@ main (int argc, char** argv)
   }
 #endif
 
-  
+
 }
