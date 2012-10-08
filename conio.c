@@ -61,8 +61,6 @@ main (int argc, char** argv)
   UNREFERENCED_PARAMETER (argc);
   UNREFERENCED_PARAMETER (argv);
 
-  LoadLibraryA ("conio-32.dll");
-
   if (!argv[1])
     {
       fprintf (stderr, "no program to run\n");

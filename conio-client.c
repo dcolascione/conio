@@ -37,8 +37,11 @@
 // variable back to FALSE if it knows it wants to call the hooked
 // version of an API.)
 //
+// Use TLS APIs directly instead of __thread in order
+// to avoid taking a C runtime dependency.
+//
 
-static __thread BOOL ConpAreHooksInhibited;
+static ULONG ConpTlsIndex;
 
 //
 // Our fake console handles end one of the tags below so we can
@@ -179,6 +182,26 @@ ULONG
 ConpHandleToIndex (
     HANDLE Handle
     );
+
+static
+BOOL
+ConpAreHooksEnabled (
+    VOID
+    )
+{
+    ULONG_PTR TlsInfo = (ULONG_PTR) TlsGetValue (ConpTlsIndex);
+    return TlsInfo == 0; // Sense is flipped so that zero-init is "on"
+}
+
+static
+VOID
+ConpSetHooksEnabled (
+    BOOL Enabled
+    )
+{
+    ULONG_PTR TlsInfo = !Enabled;
+    CONP_VERIFY (TlsSetValue (ConpTlsIndex, (PVOID) TlsInfo));
+}
 
 static
 BOOL
@@ -1286,11 +1309,11 @@ Environment:
     ULONG i;
     ULONG LargestHandle;
     ULONG NewHandleTableSize;
-    BOOL OldHooksInhibited = ConpAreHooksInhibited;
-    PCON_SLAVE Slave;
+    BOOL OldHooksEnabled = ConpAreHooksEnabled ();
+    PCON_SLAVE Slave = NULL;
     ULONG ExpectedSectionSize;
 
-    ConpAreHooksInhibited = TRUE;
+    ConpSetHooksEnabled (FALSE);
 
     //
     // Map the startup section into our address space.  The section
@@ -1310,14 +1333,14 @@ Environment:
 
     if (Section == NULL) {
 
-        ConpTrace (L"OpenFileMapping FAILED 0x%lx [%s]",
-                   GetLastError (),
-                   StartupInfoSectionName);
-
         if (GetLastError () == ERROR_FILE_NOT_FOUND ||
             GetLastError () == ERROR_PATH_NOT_FOUND)
         {
             Result = TRUE;
+        } else {
+            ConpTrace (L"OpenFileMapping FAILED 0x%lx [%s]",
+                       GetLastError (),
+                       StartupInfoSectionName);
         }
 
         goto Out;
@@ -1455,7 +1478,7 @@ Environment:
         ConpDereferenceSlave (Slave);
     }
 
-    ConpAreHooksInhibited = OldHooksInhibited;
+    ConpSetHooksEnabled (OldHooksEnabled);
     return Result;
 }
 
@@ -1965,6 +1988,7 @@ ConpSlaveCookie (
     ULONG Cookie;
 
     CONP_ASSERT (Slave);
+
     Cookie = Slave->Cookie;
     ConpDereferenceSlave (Slave);
     return Cookie;
@@ -2499,13 +2523,13 @@ Environment:
     static ret WINAPI ConpHookBody##api argdecl;       \
     static ret WINAPI ConpHook##api argdecl {          \
         ret Result;                                    \
-        if (ConpAreHooksInhibited) {                   \
+        if (!ConpAreHooksEnabled ()) {                 \
             return ConpOrig##api arguse;               \
         }                                              \
                                                        \
-        ConpAreHooksInhibited = TRUE;                  \
+        ConpSetHooksEnabled (FALSE);                   \
         Result = ConpHookBody##api arguse;             \
-        ConpAreHooksInhibited = FALSE;                 \
+        ConpSetHooksEnabled (TRUE);                    \
         return Result;                                 \
     }                                                  \
                                                        \
@@ -2549,18 +2573,18 @@ HOOK (CreateFileA, HANDLE,
     if (lpFileName && ConpIsAttachedAsSlave ()) {
         PCWSTR MagicName;
 
-        if (!lstrcmpiA (lpFileName, "CON")) {
+        if (!_stricmp (lpFileName, "CON")) {
             MagicName = L"CON";
-        } else if (!lstrcmpiA (lpFileName, "CONIN$")) {
+        } else if (!_stricmp (lpFileName, "CONIN$")) {
             MagicName = L"CONIN$";
-        } else if (!lstrcmpiA (lpFileName, "CONOUT$")) {
+        } else if (!_stricmp (lpFileName, "CONOUT$")) {
             MagicName = L"CONOUT$";
         } else {
             MagicName = NULL;
         }
 
         if (MagicName != NULL) {
-            ConpAreHooksInhibited = FALSE;
+            ConpSetHooksEnabled (TRUE);
             return CreateFileW (MagicName,
                                 dwDesiredAccess,
                                 dwShareMode,
@@ -2605,9 +2629,9 @@ HOOK (CreateFileW, HANDLE,
     // normal CreateFileW.
     //
 
-    if (lpFileName && ( !lstrcmpiW (lpFileName, L"CON")     ||
-                        !lstrcmpiW (lpFileName, L"CONIN$")  ||
-                        !lstrcmpiW (lpFileName, L"CONOUT$") ))
+    if (lpFileName && ( !_wcsicmp (lpFileName, L"CON")     ||
+                        !_wcsicmp (lpFileName, L"CONIN$")  ||
+                        !_wcsicmp (lpFileName, L"CONOUT$") ))
     {
         AcquireSRWLockShared (&ConpAttachedConsoleLock);
         if (ConpAttachedInput) {
@@ -2644,7 +2668,7 @@ HOOK (CreateFileW, HANDLE,
         // MSDN: the meaning of "CON" depends on desired access.
         //
 
-        if (!lstrcmpiW (lpFileName, L"CON")) {
+        if (!_wcsicmp (lpFileName, L"CON")) {
             if ( (dwDesiredAccess & GENERIC_READ) &&
                  (dwDesiredAccess & GENERIC_WRITE))
             {
@@ -2666,7 +2690,7 @@ HOOK (CreateFileW, HANDLE,
         // the output buffer alive.
         //
 
-        if (!lstrcmpiW (lpFileName, L"CONIN$")) {
+        if (!_wcsicmp (lpFileName, L"CONIN$")) {
             Flags |= CON_HANDLE_CONNECT_NO_OUTPUT;
         }
 
@@ -4923,16 +4947,6 @@ ConpHookApi (
                 return FALSE;
             }
 
-#if 0
-            fprintf (stderr, "hooked %S!%s orig:%p new:%p saved:%p\n",
-                     Dlls[i], ApiName,
-                     Original,
-                     HookFunction,
-                     * ((PVOID*) BackupVariable));
-
-            fflush (stderr);
-#endif
-
             NumberReplacements += 1;
             break;
         }
@@ -4951,7 +4965,31 @@ BOOL
 ConpHookApis (
     VOID
     )
+/*++
+
+Routine Description:
+
+    This routine initializes the conio client.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    TRUE on success; FALSE on failure with thread-eror set.
+
+Environment:
+
+    Call once when DLL loads.
+
+--*/
 {
+    ConpTlsIndex = TlsAlloc ();
+    if (ConpTlsIndex == TLS_OUT_OF_INDEXES) {
+        return FALSE;
+    }
+
 #ifndef COLLECTING_HOOKS
 # define REGHOOK(api)                                                   \
     if (!ConpHookApi (# api, ConpHook##api, &ConpOrig##api )) {         \
@@ -4965,28 +5003,112 @@ ConpHookApis (
     return TRUE;
 }
 
+int
+Conp_scwprintf (PCWSTR Format, ...)
+{
+    va_list Args;
+    int Length;
+
+    va_start (Args, Format);
+    Length = _vscwprintf (Format, Args);
+    va_end (Args);
+    return Length;
+}
+
 VOID
 ConpTrace (
     PCWSTR Format,
     ...)
 {
-#if 0
     va_list Args;
-    ULONG SavedError;
-    static SRWLOCK TraceLock;
+    ULONG SavedError = GetLastError ();
+    int FormatLength;
+    int NeededLength;
+    PWSTR Buffer = NULL;
+    BOOL OldHooksEnabled;
+    BOOL ResetHooks = FALSE;
 
-    SavedError = GetLastError ();
-    AcquireSRWLockExclusive (&TraceLock);
-    {
-        va_start (Args, Format);
-        vfwprintf (stderr, Format, Args);
-        fputwc (L'\n', stderr);
-        fflush (stderr);
-        va_end (Args);
+
+    static SRWLOCK LogLock;
+    static HANDLE Log;
+    BOOL LogLockHeld = FALSE;
+    ULONG BytesWritten;
+    PSTR AnsiBuffer = NULL;
+    SIZE_T AnsiLength;
+    SYSTEMTIME Now;
+
+    if (ConpTlsIndex > 0) {
+        ResetHooks = TRUE;
+        OldHooksEnabled = ConpAreHooksEnabled ();
+        ConpSetHooksEnabled (FALSE);
     }
 
-    ReleaseSRWLockExclusive (&TraceLock);
-    SetLastError (SavedError);
-#endif
-}
+    GetLocalTime (&Now);
 
+#define PREFIX L"%02u:%02u:%02u: %04u.%04u: ",               \
+        Now.wHour, Now.wMinute, Now.wSecond,                 \
+        GetCurrentProcessId (), GetCurrentThreadId ()
+
+    NeededLength = 0;
+    NeededLength += Conp_scwprintf (PREFIX);
+
+    va_start (Args, Format);
+    NeededLength += _vscwprintf (Format, Args);
+    va_end (Args);
+
+    NeededLength += 1; // Terminating nul
+
+    Buffer = LocalAlloc (0, sizeof (WCHAR) * (NeededLength));
+    if (Buffer == NULL) {
+        goto Out;
+    }
+
+    FormatLength = 0;
+    FormatLength += swprintf (Buffer + FormatLength, PREFIX);
+    FormatLength += _vswprintf (Buffer + FormatLength, Format, Args);
+    OutputDebugString (Buffer);
+
+    AnsiBuffer = LocalAlloc (0, 2 * (FormatLength + 2));
+    AnsiLength = wcstombs (AnsiBuffer, Buffer, 2 * (FormatLength + 2));
+    AnsiBuffer[AnsiLength++] = '\n';
+    AnsiBuffer[AnsiLength] = '\0';
+
+    AcquireSRWLockExclusive (&LogLock);
+    LogLockHeld = TRUE;
+
+    if (Log == NULL) {
+        Log = CreateFile (L"conio.log",
+                          FILE_APPEND_DATA,
+                          ( FILE_SHARE_READ |
+                            FILE_SHARE_WRITE |
+                            FILE_SHARE_DELETE ),
+                          NULL /* No special security */,
+                          OPEN_ALWAYS,
+                          FILE_ATTRIBUTE_NORMAL,
+                          NULL);
+
+        if (Log == INVALID_HANDLE_VALUE) {
+            Log = NULL;
+            goto Out;
+        }
+    }
+
+    (VOID) WriteFile (Log, AnsiBuffer,
+                      AnsiLength,
+                      &BytesWritten, NULL);
+
+  Out:
+
+    if (LogLockHeld) {
+        ReleaseSRWLockExclusive (&LogLock);
+    }
+
+    LocalFree (Buffer);
+    LocalFree (AnsiBuffer);
+
+    if (ResetHooks) {
+        ConpSetHooksEnabled (OldHooksEnabled);
+    }
+
+    SetLastError (SavedError);
+}

@@ -18,6 +18,7 @@ static BOOL (WINAPI *HkpOriginalCreateProcessW)(
 
 static PSTR HkpModuleName32;
 static PSTR HkpModuleName64;
+static ULONG HkpTlsIndex;
 
 enum HKP_INITIALIZATION_STATE {
     HkpInitNotStarted    = 0,
@@ -41,10 +42,10 @@ HkpHookedCreateProcessW (
     LPPROCESS_INFORMATION ProcessInformation
     )
 {
-    static __thread BOOL InHook = FALSE;
+    ULONG_PTR InHook = (ULONG_PTR) TlsGetValue (HkpTlsIndex);
     BOOL Result;
 
-    if (InHook != FALSE) {
+    if (InHook) {
         return HkpOriginalCreateProcessW (
             ApplicationName,
             CommandLine,
@@ -58,7 +59,11 @@ HkpHookedCreateProcessW (
             ProcessInformation);
     }
 
-    InHook = TRUE;
+    InHook = 1;
+    if (!TlsSetValue (HkpTlsIndex, (PVOID) InHook)) {
+        return FALSE;
+    }
+
     Result = HkCreateProcessW (
         ApplicationName,
         CommandLine,
@@ -72,8 +77,9 @@ HkpHookedCreateProcessW (
         ProcessInformation,
         HkpModuleName32,
         HkpModuleName64);
-        
-    InHook = FALSE;
+
+    InHook = 0;
+    (VOID) TlsSetValue (HkpTlsIndex, (PVOID) InHook);
     return Result;
 }
 
@@ -119,7 +125,7 @@ Environment:
     {
         SetLastError (ERROR_INVALID_PARAMETER);
         goto Out;
-    }        
+    }
 
     //
     // If another thread is doing initialization, poll until it's
@@ -149,6 +155,11 @@ Environment:
     if (InitState == HkpInitFailed) {
         SetLastError (ERROR_BAD_ENVIRONMENT);
         return FALSE;
+    }
+
+    HkpTlsIndex = TlsAlloc ();
+    if (HkpTlsIndex == TLS_OUT_OF_INDEXES) {
+        goto Out;
     }
 
     ModuleName32Length = strlen (ModuleName32) + 1;
@@ -518,9 +529,11 @@ Environment:
                                     XLDR_DATA_TABLE_ENTRY,
                                     InMemoryOrderLinks);
 
-        if (!HkpHookFunctionImport (Function, Replacement, Module) ||
-            !HkpHookFunctionExport (Function, Replacement, Module))
-        {
+        if (!HkpHookFunctionImport (Function, Replacement, Module)) {
+            goto Out;
+        }
+
+        if (!HkpHookFunctionExport (Function, Replacement, Module)) {
             goto Out;
         }
     }

@@ -129,6 +129,12 @@ Environment:
     }
 
     //
+    // Defeat binding.
+    //
+
+    NtHeaders.FileHeader.TimeDateStamp += 1;
+
+    //
     // Build a replacement import directory by prefixing the existing
     // import directory with our dummy import.
     //

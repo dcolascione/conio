@@ -21,7 +21,8 @@ DllMain (HINSTANCE Inst,
                     "conio-32.dll",
                     "conio-64.dll")
                 || !ConpHookApis ()
-                || !ConpInheritConsoleInformation ())
+                || !ConpInheritConsoleInformation ()
+                )
             {
                 return FALSE;
             }

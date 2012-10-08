@@ -153,4 +153,6 @@ ConpConnectSlaveHandle (
 VOID ConpTrace (PCWSTR Format, ...);
 BOOL ConpHookApis (VOID);
 
+#if 0
 #define MemoryBarrier() __sync_synchronize ()
+#endif
