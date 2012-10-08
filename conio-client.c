@@ -4955,6 +4955,34 @@ Conp_scwprintf (PCWSTR Format, ...)
     return Length;
 }
 
+PWSTR
+ConpGetAndAllocateModuleFileName (
+    HMODULE Module
+    )
+{
+    PWSTR Name = NULL;
+    ULONG Length = 0;
+    ULONG NeededLength = 64;
+
+    do {
+        LocalFree (Name);
+        Length = NeededLength * 2;
+        Name = LocalAlloc (0, sizeof (WCHAR) * Length);
+        if (Name == NULL) {
+            break;
+        }
+
+        NeededLength = GetModuleFileName (Module, Name, Length);
+    } while (NeededLength >= Length);
+
+    if (NeededLength == 0) {
+        LocalFree (Name);
+        Name = NULL;
+    }
+
+    return Name;
+}
+
 VOID
 ConpTrace (
     PCWSTR Format,
@@ -4968,14 +4996,17 @@ ConpTrace (
     BOOL OldHooksEnabled;
     BOOL ResetHooks = FALSE;
 
-
     static SRWLOCK LogLock;
     static HANDLE Log;
+
     BOOL LogLockHeld = FALSE;
     ULONG BytesWritten;
     PSTR AnsiBuffer = NULL;
     SIZE_T AnsiLength;
     SYSTEMTIME Now;
+
+    PWSTR ModuleFileName = NULL;
+    PCWSTR ModuleFileBaseName;
 
     if (ConpTlsIndex > 0) {
         ResetHooks = TRUE;
@@ -4984,9 +5015,21 @@ ConpTrace (
     }
 
     GetLocalTime (&Now);
+    ModuleFileName = ConpGetAndAllocateModuleFileName (NULL);
+    if (ModuleFileName) {
+        ModuleFileBaseName = wcsrchr (ModuleFileName, L'\\');
+        if (ModuleFileBaseName == NULL) {
+            ModuleFileBaseName = ModuleFileName;
+        } else {
+            ModuleFileBaseName += 1;
+        }
+    } else {
+        ModuleFileBaseName = L"[Error]";
+    }
 
-#define PREFIX L"%02u:%02u:%02u: %04u.%04u: ",               \
+#define PREFIX L"%02u:%02u:%02u: %s(%04u).%04u: ",           \
         Now.wHour, Now.wMinute, Now.wSecond,                 \
+        ModuleFileBaseName,                                  \
         GetCurrentProcessId (), GetCurrentThreadId ()
 
     NeededLength = 0;
@@ -5045,6 +5088,7 @@ ConpTrace (
 
     LocalFree (Buffer);
     LocalFree (AnsiBuffer);
+    LocalFree (ModuleFileName);
 
     if (ResetHooks) {
         ConpSetHooksEnabled (OldHooksEnabled);
