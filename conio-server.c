@@ -896,7 +896,10 @@ Environment:
     }
 
     if (IoResult != NO_ERROR) {
-        ConpTrace (L"CONN %p ERROR 0x%lx", Connection, IoResult);
+        if (IoResult != ERROR_BROKEN_PIPE) {
+            ConpTrace (L"CONN %p ERROR 0x%lx", Connection, IoResult);
+        }
+
         goto Out;
     }
 

@@ -1347,8 +1347,11 @@ Environment:
     }
 
     ConpTrace (L"Found inheritance section!");
+
+#if 0
     extern VOID WINAPI DbgBreakPoint (VOID);
     DbgBreakPoint ();
+#endif
 
     ConStartupInfo = MapViewOfFile (Section, FILE_MAP_READ, 0, 0, 0);
     if (ConStartupInfo == NULL) {
@@ -2960,65 +2963,6 @@ HOOK (WaitForMultipleObjectsEx, DWORD,
 
     return WaitForMultipleObjectsEx (nCount, lpHandles, bWaitAll,
                                      dwMilliseconds, bAlertable);
-}
-
-HOOK (MsgWaitForMultipleObjects, DWORD,
-      ( DWORD nCount,
-        const HANDLE *lpHandles,
-        BOOL bWaitAll,
-        DWORD dwMilliseconds,
-        DWORD dwWakeMask ),
-      ( nCount,
-        lpHandles,
-        bWaitAll,
-        dwMilliseconds,
-        dwWakeMask ))
-{
-    ULONG i;
-
-    for (i = 0; i < nCount; ++i) {
-        if (ConpIsSlave (lpHandles[i])) {
-            return ConpWaitForObjects (
-                nCount, lpHandles,
-                dwMilliseconds,
-                TRUE /* WaitForMessages */,
-                dwWakeMask,
-                0 /* Flags */);
-        }
-    }
-
-    return MsgWaitForMultipleObjects (nCount, lpHandles, bWaitAll,
-                                      dwMilliseconds, dwWakeMask);
-}
-
-HOOK (MsgWaitForMultipleObjectsEx, DWORD,
-      ( DWORD nCount,
-        const HANDLE *lpHandles,
-        DWORD dwMilliseconds,
-        DWORD dwWakeMask,
-        DWORD dwFlags ),
-      ( nCount,
-        lpHandles,
-        dwMilliseconds,
-        dwWakeMask,
-        dwFlags ))
-{
-    ULONG i;
-
-    for (i = 0; i < nCount; ++i) {
-        if (ConpIsSlave (lpHandles[i])) {
-            return ConpWaitForObjects (
-                nCount, lpHandles,
-                dwMilliseconds,
-                TRUE /* WaitForMessages */,
-                dwWakeMask,
-                dwFlags);
-        }
-    }
-
-    return MsgWaitForMultipleObjectsEx (nCount, lpHandles,
-                                        dwMilliseconds, dwWakeMask,
-                                        dwFlags);
 }
 
 HOOK (RegisterWaitForSingleObject, BOOL,
@@ -4920,8 +4864,7 @@ ConpHookApi (
 {
     static const PCWSTR Dlls[] = {
         L"kernelbase.dll",
-        L"kernel32.dll",
-        L"user32.dll"
+        L"kernel32.dll"
     };
 
     ULONG i;

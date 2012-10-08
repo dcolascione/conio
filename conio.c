@@ -40,8 +40,9 @@ pty_ConHandleRequest (
       Request->WriteFile.NumberBytesWritten =
         Request->WriteFile.NumberBytesToWrite;
 
-      fprintf (stderr, "CONIO: WriteFile: %lu [%s]\n",
+      fprintf (stderr, "CONIO: WriteFile: %lu [%.*s]\n",
                Request->WriteFile.NumberBytesToWrite,
+               (int) Request->WriteFile.NumberBytesToWrite,
                (char*) Request->WriteFile.Buffer);
 
       break;

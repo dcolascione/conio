@@ -132,7 +132,7 @@ Environment:
     // Defeat binding.
     //
 
-    // XXX NtHeaders.FileHeader.TimeDateStamp += 1;
+    NtHeaders.FileHeader.TimeDateStamp += 1;
 
     //
     // Build a replacement import directory by prefixing the existing

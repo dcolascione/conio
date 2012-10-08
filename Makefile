@@ -41,7 +41,7 @@ CONIO_SOURCES=conio-dll.c conio-client.c conio-server.c hook.c
 conio-32.dll: override CPPFLAGS+=-DCONIO_BUILDING_DLL
 conio-64.dll: override CPPFLAGS+=-DCONIO_BUILDING_DLL
 
-CONIO_DLL_LDFLAGS=-nostdlib -lkernel32 -luser32 -lntdll
+CONIO_DLL_LDFLAGS=-nostdlib -lkernel32 -lntdll
 CONIO_DLL_LDFLAGS+=-lmingwex
 
 conio-32.dll: $(CONIO_SOURCES:%.c=%.o32)
