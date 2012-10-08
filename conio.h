@@ -72,7 +72,8 @@ typedef enum _CON_REQUEST_TYPE {
     // request successfully, a new console handle is given to the
     // client.  Subsequent operations on this handle use the
     // CreateConsoleScreenBuffer.NewOutputContext value set by the
-    // client.  This value defaults to zero.
+    // client.  The default value of
+    // CreateConsoleScreenBuffer.NewOutputContext is zero.
     //
     // The default handler returns success and does not modify
     // CreateConsoleScreenBuffer.NewOutputContext.
