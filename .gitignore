@@ -1,0 +1,6 @@
+*.dll
+*-generated.c
+*.o32
+*.o64
+*.log
+*.exe
