@@ -158,6 +158,8 @@ typedef enum _CON_REQUEST_TYPE {
 
 } CON_REQUEST_TYPE, *PCON_REQUEST_TYPE;
 
+#define CON_LAST_REQUEST ConDestroy
+
 typedef struct _CON_REQUEST {
 
     //

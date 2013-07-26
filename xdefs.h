@@ -10,8 +10,11 @@
 #include <ddk/ntddk.h>
 #include <ddk/ntifs.h>
 #else
-#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #include <winternl.h>
+#endif
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
 
 typedef struct _XPROCESS_BASIC_INFORMATION {

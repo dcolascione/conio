@@ -14,7 +14,7 @@ override CFLAGS+=-Wno-unused
 override CFLAGS+=-mthreads
 override CFLAGS+=-fno-stack-protector
 
-all: conio conio-32.dll conio-64.dll
+all: contest conio-32.dll conio-64.dll
 
 # Compile, assemble, and link as separate stages to work around
 # "unknown register" tooling bug.
@@ -54,10 +54,10 @@ conio-64.dll: $(CONIO_SOURCES:%.c=%.o64)
 		-o $@ $^ $(CONIO_DLL_LDFLAGS) \
 		-Wl,-e,DllMain
 
-conio: conio.c conio-32.dll conio-64.dll
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@   \
-		conio.c hook.c conio-32.dll \
-		-lntdll -lpsapi
+CONTEST_SOURCES=contest.c
+
+contest: $(CONTEST_SOURCES:%.c=%.o32) conio-32.dll
+	$(MINGW32CC) $(CFLAGS) -o $@ $^
 
 clean:
 	rm -f ./*.exe ./*.dll ./*.o ./*.o64 ./*.o32 ./*.i \
